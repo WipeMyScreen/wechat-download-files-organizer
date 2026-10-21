@@ -4,7 +4,7 @@
 
 在当前 Windows 用户的文档目录下查找 `xwechat_files\<账号文件夹>\msg\file`, 然后把微信下载的文件,移动到\msg\file里的"整理归纳"这个文件夹内的相应目录,  目录为 `word`、`excel`、`ppt`、`压缩包`、`DWG`、`其他`
 
-按文件扩展名将文件归入 Word、Excel、PPT、压缩包、DWG 和其他分类，并生成包含文件数量与 KB 大小的 TXT 统计报告。
+按文件扩展名将文件归入 Word、Excel、PPT、压缩包、DWG 和其他分类，并生成包含文件数量与大小的 TXT 统计报告，大小自动选择 KB、MB 或 GB。
 
 支持先预览再整理；同名文件自动编号，保留全部文件。
 
@@ -23,24 +23,64 @@
 | 环境 | 要求 |
 | --- | --- |
 | 操作系统 | Windows |
-| 执行环境 | PowerShell 7 或更新版本，终端中可运行 `pwsh` |
-| Codex | 使用 skill 方式调用时需要；直接运行脚本不需要 Codex |
+| 执行环境 | Windows 自带的 Windows PowerShell 5.1，或 PowerShell 7；无需额外安装 7 |
+| AI 工具 | Windows 本机的 Codex 或 Claude Code；直接运行脚本不需要 AI 工具 |
+| 脚本执行策略 | 必须允许该脚本执行；Windows 客户端默认 Restricted 会阻止 `.ps1`，见下方处理说明 |
 | 文件权限 | 预览需要读取权限；正式整理需要源目录及目标目录的相应读写权限 |
 | Python | 仅运行测试时需要 Python 3，日常整理不需要 |
 
 可以通过以下命令检查 PowerShell 版本：
 
 ```powershell
-pwsh --version
+powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion'
 ```
 
 脚本通过本地文件系统操作文件，不需要微信登录接口或 API 密钥。
 
-## 安装到 Codex
+Windows 11 自带的是 Windows PowerShell 5.1（`powershell.exe`），PowerShell 7（`pwsh.exe`）需另外安装，二者可并存，见 [Microsoft 官方说明](https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows)。本包兼容两者，不依赖某个 AI 工具附带的私有运行时。
+
+保留 `scripts/organize.ps1` 的 UTF-8 BOM；不要另存为无 BOM 的 UTF-8 或 ANSI。脚本的控制台输出和统计报告均显式使用 UTF-8。默认调用不修改或覆盖 PowerShell 执行策略。运行时兼容与脚本执行权限是独立的前提。
+
+## 执行策略与自动模式权限
+
+Windows 自带 PowerShell 5.1，并不代表默认允许执行 `.ps1`。所有作用域均为 `Undefined` 时，Windows 客户端的有效策略为 `Restricted`，仍会禁止运行脚本。默认示例遵守现有策略，不自动附加 `-ExecutionPolicy Bypass`。
+
+若出现 `UnauthorizedAccess`、`PSSecurityException` 或“禁止运行脚本”，先在 PowerShell 或 Git Bash 中只读检查：
+
+```text
+powershell.exe -NoProfile -NonInteractive -Command 'Get-ExecutionPolicy -List; Get-ExecutionPolicy'
+```
+
+普通的“整理微信文件”请求不授权调整执行策略。若这是你自行管理的电脑，在理解并选择后，可由你手动配置当前用户：
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+这会持久影响当前用户，允许本地未签名脚本运行；带有 Internet 来源标记的脚本需要可信签名。此命令不是 skill 自动执行的步骤。原作用域为 `Undefined` 时，如需恢复可由你运行 `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Undefined`；若原值不同，应恢复原值。已有组织策略时遵守管理员规定。
+
+也可以明确授权仅某个 PowerShell 进程使用 `RemoteSigned`，而不持久修改当前用户；取得这项授权后才可为该进程添加 `-ExecutionPolicy RemoteSigned`。两种范围不能互相代替授权。
+
+从浏览器下载的 ZIP 或脚本可能带 Internet 来源标记；即使使用 `RemoteSigned`，也不能承诺任何下载来源都可直接运行。遇到签名或来源限制时，检查来源和组织要求，不自动解除阻止。
+
+Claude 自动模式若拒绝执行策略调整，应明确报告拒绝原因并等待用户授权或由用户手动完成配置，不用延时重试、内联/编码执行或切换解释器避开拦截。脚本被系统阻止时，脚本内的 UTF-8 输出设置尚未运行，因此错误中文可能乱码；`UnauthorizedAccess` 仍可用于辨认失败类型。
+
+官方参考：[Microsoft 执行策略](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies?view=powershell-5.1)、[Claude 自动模式](https://code.claude.com/docs/s/claude-code-auto-mode)。
+
+## 安装到 Codex 或 Claude Code
 
 1. 从本仓库下载 ZIP 并解压，或使用 Git 克隆仓库。
 2. 将包含 `SKILL.md` 的整个文件夹命名为 `wechat_download_files_organizer`。
-3. 把该文件夹放入当前用户的 `%USERPROFILE%\.agents\skills\` 目录。目录不存在时先创建；若已有同名 skill，请先备份。
+3. 把同一个完整文件夹复制到所用工具的用户技能目录（若已有同名版本，先备份）：
+
+| 工具 | 安装目录 | 显式调用 |
+| --- | --- | --- |
+| Codex | `%USERPROFILE%\.agents\skills\wechat_download_files_organizer\` | `$wechat_download_files_organizer` |
+| Claude Code | `%USERPROFILE%\.claude\skills\wechat_download_files_organizer\` | `/wechat_download_files_organizer` |
+
+同时使用两个工具时，分别复制一份；两边使用完全相同的脚本和规则。目录不存在时先创建，不要多套一层同名文件夹。
+
+安装位置参考：[Codex 官方说明](https://developers.openai.com/codex/build-skills)、[Claude Code 官方说明](https://code.claude.com/docs/en/skills)。
 
 安装后的结构应为：
 
@@ -57,7 +97,15 @@ pwsh --version
         └── test_organizer.py
 ```
 
-如果 Codex 没有显示新安装的 skill，请重启 Codex 后重试。
+如果工具没有显示新安装或更新的 skill，请重新启动对应工具或新建会话。
+
+## 在 Claude Code 中使用
+
+输入 `/wechat_download_files_organizer`，或附上“预览微信文件，先不要移动文件”。未指定目录时，会先列出候选账号并等待选择。
+
+本包用 Windows 自带的 `powershell.exe` 执行，无需 `pwsh`。Claude Code 使用 Git Bash 时，调用参数相同；若 PATH 中找不到 `powershell.exe`，可使用 `"${SYSTEMROOT:-C:/Windows}/System32/WindowsPowerShell/v1.0/powershell.exe"`。
+
+若会话的访问控制阻止读取或执行用户级 skill 目录，按工具提示授予该目录的访问权限，或把同一完整文件夹放到项目的 `.claude/skills/` 下。不要以安装 PowerShell 或改用其他脚本替代目录权限问题。
 
 ## 在 Codex 中使用
 
@@ -88,7 +136,7 @@ pwsh --version
 ### 1. 列出候选账号
 
 ```powershell
-pwsh -NoProfile -File "./scripts/organize.ps1" -ListAccounts -AsJson
+powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -ListAccounts -AsJson
 ```
 
 默认搜索当前 Windows 用户文档目录中的 `xwechat_files\<账号文件夹>\msg\file`。发现阶段仅检查账号目录结构，不遍历账号中的文件。
@@ -96,13 +144,13 @@ pwsh -NoProfile -File "./scripts/organize.ps1" -ListAccounts -AsJson
 指定其他 `xwechat_files` 位置：
 
 ```powershell
-pwsh -NoProfile -File "./scripts/organize.ps1" -ListAccounts -WechatBasePath "<xwechat_files 的完整路径>" -AsJson
+powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -ListAccounts -WechatBasePath "<xwechat_files 的完整路径>" -AsJson
 ```
 
 ### 2. 只读预览
 
 ```powershell
-pwsh -NoProfile -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -AsJson
+powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -AsJson
 ```
 
 预览不会移动文件，也不会创建分类目录或统计报告。
@@ -110,7 +158,7 @@ pwsh -NoProfile -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file �
 ### 3. 正式整理
 
 ```powershell
-pwsh -NoProfile -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -Apply -AsJson
+powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -Apply -AsJson
 ```
 
 `-AsJson` 可省略，省略后输出可读文本。`-ListAccounts` 不能与 `-RootPath` 或 `-Apply` 同时使用；`-WechatBasePath` 仅用于列出账号。预览和正式整理都必须明确提供 `-RootPath`。
@@ -146,7 +194,9 @@ msg/file/
 
 每次正式运行都会覆盖更新 UTF-8 编码的 `整理统计.txt`，即使本次没有文件需要移动。再次整理时会跳过整个 `整理归纳` 目录，避免重复移动已归类文件。
 
-统计范围为 `整理归纳` 下所有直接子文件夹中的递归文件，包含已有文件及用户新增目录；空目录显示零，链接跳过。大小按 **1 KB = 1024 字节** 换算，保留两位小数，使用文件逻辑大小。`整理归纳` 根目录中的文件不计入总计。
+统计范围为 `整理归纳` 下所有直接子文件夹中的递归文件，包含已有文件及用户新增目录；空目录显示零，链接跳过。各文件夹和总计分别自动选择大小单位：小于 1 MB 显示 KB，达到 1 MB 且小于 1 GB 显示 MB，达到 1 GB 显示 GB。按 **1 KB = 1024 字节、1 MB = 1024 KB、1 GB = 1024 MB** 换算，保留两位小数，使用文件逻辑大小；空目录显示 `0.00 KB`。总计基于原始字节数独立计算和换算。`整理归纳` 根目录中的文件不计入总计。
+
+JSON 输出新增 `Statistics[].Size`（如 `1.50 GB`），同时保留原有 `SizeKB` 字段，兼容已有调用。
 
 下面为报告格式示例，时间和数据仅作演示：
 
@@ -157,14 +207,14 @@ msg/file/
 
 文件夹         文件数量         文件大小
 --------------------------------------------
-word            12 个        18432.00 KB
-excel            8 个         6144.00 KB
-ppt              5 个        46080.00 KB
-压缩包           4 个       122880.00 KB
-DWG              7 个        32768.00 KB
-其他            15 个        24576.00 KB
+word            12 个           18.00 MB
+excel            8 个            6.00 MB
+ppt              5 个           45.00 MB
+压缩包           4 个          120.00 MB
+DWG              7 个           32.00 MB
+其他            15 个           24.00 MB
 --------------------------------------------
-总计            51 个       250880.00 KB
+总计            51 个          245.00 MB
 
 说明：
 统计包含子文件夹中的文件。
@@ -193,10 +243,12 @@ DWG              7 个        32768.00 KB
 
 ## 运行测试
 
-需要 Windows、PowerShell 7 和 Python 3。在仓库根目录运行：
+测试需要 Windows 和 Python 3（日常使用不需要 Python）。默认使用系统自带的 PowerShell 5.1，且要求已有策略允许执行本地脚本。测试不改变策略，在仓库根目录运行：
 
 ```powershell
 python ./tests/test_organizer.py
 ```
+
+要验证 PowerShell 7，在 PowerShell 中先设 `$env:WECHAT_TEST_POWERSHELL = "pwsh"` 再运行相同测试；也可指定可执行文件的完整路径。测试脚本按 UTF-8 读取输出。
 
 测试使用独立临时目录，不操作真实微信下载目录。临时目录创建在仓库的父目录下，因此该位置需要写入权限；涉及文件符号链接的测试在缺少相应 Windows 权限时会跳过。

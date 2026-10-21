@@ -3,13 +3,19 @@ import collections
 import ctypes
 import hashlib
 import json
+import msvcrt
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import unittest
 import uuid
+
+POWERSHELL = os.environ.get("WECHAT_TEST_POWERSHELL", "powershell.exe")
+# Each engine must discover its own modules rather than inherit another engine's.
+POWERSHELL_ENV = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "organize.ps1"
 CATEGORIES = ["word", "excel", "ppt", "压缩包", "DWG", "其他"]
@@ -24,10 +30,10 @@ EXTENSIONS = {
 
 
 def run(root, apply=False, check=True):
-    args = ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-RootPath", str(root), "-AsJson"]
+    args = [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT), "-RootPath", str(root), "-AsJson"]
     if apply:
         args.append("-Apply")
-    result = subprocess.run(args, capture_output=True, encoding="utf-8")
+    result = subprocess.run(args, capture_output=True, encoding="utf-8", env=POWERSHELL_ENV)
     if not check:
         return result
     if result.returncode:
@@ -37,9 +43,9 @@ def run(root, apply=False, check=True):
 
 def discover(base, *extra):
     result = subprocess.run(
-        ["pwsh", "-NoProfile", "-File", str(SCRIPT), "-ListAccounts",
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT), "-ListAccounts",
          "-WechatBasePath", str(base), "-AsJson", *extra],
-        capture_output=True, encoding="utf-8",
+        capture_output=True, encoding="utf-8", env=POWERSHELL_ENV,
     )
     if result.returncode:
         raise AssertionError(result.stderr)
@@ -49,6 +55,23 @@ def discover(base, *extra):
 def put(path, content=b"x" * 1024):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
+    return path
+
+
+def put_sparse(path, size):
+    """Use NTFS sparse files to test GB logical sizes without writing GB of data."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.DeviceIoControl.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+                                      ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
+                                      ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+    kernel.DeviceIoControl.restype = ctypes.c_int
+    with path.open("wb") as stream:
+        returned = ctypes.c_uint32()
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        if not kernel.DeviceIoControl(handle, 0x900C4, None, 0, None, 0, ctypes.byref(returned), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        stream.truncate(size)
     return path
 
 
@@ -80,16 +103,37 @@ class ExclusiveFile:
 
 class OrganizerTests(unittest.TestCase):
     def setUp(self):
-        self.temp_path = SCRIPT.parents[2] / ("wechat-organizer-test-" + uuid.uuid4().hex)
+        self.temp_path = SCRIPT.parents[2] / ("wechat-organizer-test-" + uuid.uuid4().hex + " 中文 空格")
         self.temp_path.mkdir()
         self.root = self.temp_path / "file"
         self.root.mkdir()
         self.output = self.root / "整理归纳"
 
+    def make_symlink(self, *args, **kwargs):
+        try:
+            os.symlink(*args, **kwargs)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                self.skipTest("Windows symbolic-link privilege unavailable")
+            raise
+
     def tearDown(self):
         assert self.temp_path.resolve().parent == SCRIPT.parents[2].resolve()
         assert self.temp_path.name.startswith("wechat-organizer-test-")
         shutil.rmtree(self.temp_path)
+
+    def test_trailing_separators_preserve_paths_and_discovery(self):
+        source = put(self.root / "中文.docx")
+        result = run(str(self.root) + "\\")
+        self.assertTrue(result["Success"])
+        self.assertEqual(result["RootPath"], str(self.root))
+        self.assertEqual(result["FileCount"], 1)
+        self.assertTrue(source.exists())
+        base = self.temp_path / "wechat"
+        put(base / "账号" / "msg" / "file" / "样本.pdf")
+        found = discover(str(base) + "\\")
+        self.assertEqual(found["SearchRoot"], str(base))
+        self.assertEqual(found["CandidateCount"], 1)
 
     def test_discovery_lists_accounts_without_modifying_or_selecting_them(self):
         base = self.temp_path / "xwechat_files"
@@ -131,8 +175,8 @@ class OrganizerTests(unittest.TestCase):
     def test_missing_root_cannot_preview_or_apply_implicit_account(self):
         before = snapshot(self.root)
         for extra in [[], ["-Apply"]]:
-            result = subprocess.run(["pwsh", "-NoProfile", "-File", str(SCRIPT), *extra],
-                                    capture_output=True, encoding="utf-8", cwd=self.root)
+            result = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT), *extra],
+                                    capture_output=True, encoding="utf-8", cwd=self.root, env=POWERSHELL_ENV)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("未选择微信账号目录", result.stderr)
         self.assertEqual(before, snapshot(self.root))
@@ -143,11 +187,11 @@ class OrganizerTests(unittest.TestCase):
         outside_account = self.temp_path / "outside-account"
         put(outside_account / "msg" / "file" / "原件.docx")
         account_link = base / "linked-account"
-        os.symlink(outside_account, account_link, target_is_directory=True)
+        self.make_symlink(outside_account, account_link, target_is_directory=True)
         ordinary = base / "ordinary-account"
         ordinary.mkdir()
         msg_link = ordinary / "msg"
-        os.symlink(outside_account / "msg", msg_link, target_is_directory=True)
+        self.make_symlink(outside_account / "msg", msg_link, target_is_directory=True)
         try:
             result = discover(base)
             self.assertTrue(result["Success"])
@@ -207,6 +251,7 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual(stats["自定义"]["FileCount"], 1)
         self.assertEqual(stats["自定义"]["SizeKB"], "3.00")
         report_path = Path(result["ReportPath"])
+        self.assertTrue(report_path.read_bytes().startswith(b"\xef\xbb\xbf"))
         report = report_path.read_text(encoding="utf-8-sig")
         self.assertNotIn("字节", report)
         self.assertNotIn("MiB", report)
@@ -222,7 +267,7 @@ class OrganizerTests(unittest.TestCase):
         )
         self.assertEqual(contents_before, moved_contents)
         repeated = run(self.root, apply=True)
-        self.assertTrue(repeated["Success"])
+        self.assertTrue(repeated["Success"], repeated["Failures"])
         self.assertEqual(repeated["FileCount"], 0)
         self.assertEqual(repeated["Statistics"], result["Statistics"])
         self.assertEqual(repeated["ReportPath"], result["ReportPath"])
@@ -240,7 +285,7 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual([p.name for p in self.output.iterdir() if p.is_file()], ["整理统计.txt"])
         self.assertFalse(list(self.output.glob("移动记录_*.csv")))
         repeated = run(self.root, apply=True)
-        self.assertTrue(repeated["Success"])
+        self.assertTrue(repeated["Success"], repeated["Failures"])
         self.assertEqual(repeated["FileCount"], 0)
         self.assertEqual(first["Statistics"], repeated["Statistics"])
         self.assertEqual([p.name for p in self.output.iterdir() if p.is_file()], ["整理统计.txt"])
@@ -255,6 +300,52 @@ class OrganizerTests(unittest.TestCase):
         result = run(self.root, apply=True)
         other = next(r for r in result["Statistics"] if r["Folder"] == "其他")
         self.assertEqual(other["SizeKB"], "0.01")
+
+    def test_report_automatically_selects_kb_mb_and_gb(self):
+        sizes = {
+            "word": 0,
+            "excel": 1023 * 1024,
+            "ppt": 1024 ** 2,
+            "压缩包": 1536 * 1024,
+            "DWG": 1023 * 1024 ** 2,
+            "其他": 1024 ** 3,
+        }
+        expected = {
+            "word": "0.00 KB", "excel": "1023.00 KB", "ppt": "1.00 MB",
+            "压缩包": "1.50 MB", "DWG": "1023.00 MB", "其他": "1.00 GB",
+        }
+        for category, size in sizes.items():
+            if size:
+                put_sparse(self.output / category / "大小测试.bin", size)
+        result = run(self.root, apply=True)
+        self.assertTrue(result["Success"], result["Failures"])
+        stats = {row["Folder"]: row for row in result["Statistics"]}
+        report = Path(result["ReportPath"]).read_text(encoding="utf-8-sig")
+        for category, display in expected.items():
+            with self.subTest(category=category):
+                self.assertEqual(stats[category]["Size"], display)
+                self.assertEqual(stats[category]["SizeKB"], f"{sizes[category] / 1024:.2f}")
+                self.assertRegex(report, rf"(?m)^{re.escape(category)}\s+\d+ 个\s+{re.escape(display)}$")
+        self.assertRegex(report, r"总计\s+5 个\s+2\.00 GB")
+        self.assertNotIn("字节", report)
+
+    def test_total_chooses_its_own_unit_from_original_bytes(self):
+        put(self.output / "word" / "一.docx", b"x" * (768 * 1024))
+        put(self.output / "excel" / "二.xlsx", b"x" * (768 * 1024))
+        result = run(self.root, apply=True)
+        self.assertTrue(result["Success"])
+        stats = {row["Folder"]: row for row in result["Statistics"]}
+        self.assertEqual(stats["word"]["Size"], "768.00 KB")
+        self.assertEqual(stats["excel"]["Size"], "768.00 KB")
+        report = Path(result["ReportPath"]).read_text(encoding="utf-8-sig")
+        self.assertRegex(report, r"总计\s+2 个\s+1\.50 MB")
+        put(self.output / "word" / "一.docx", b"a" * (1024 ** 2))
+        put(self.output / "excel" / "二.xlsx", b"b")
+        repeated = run(self.root, apply=True)
+        self.assertTrue(repeated["Success"])
+        changed_report = Path(repeated["ReportPath"]).read_text(encoding="utf-8-sig")
+        self.assertRegex(changed_report, r"总计\s+2 个\s+1\.00 MB")
+        self.assertEqual(repeated["ReportPath"], result["ReportPath"])
 
     def test_locked_source_is_retained_and_report_counts_actual_files(self):
         blocked = put(self.root / "月份" / "占用.docx", b"locked")
@@ -284,7 +375,7 @@ class OrganizerTests(unittest.TestCase):
         outside.mkdir()
         put(outside / "不能移动.docx", b"outside")
         link = self.root / "目录链接"
-        os.symlink(outside, link, target_is_directory=True)
+        self.make_symlink(outside, link, target_is_directory=True)
         try:
             result = run(self.root, apply=True)
             self.assertTrue(result["Success"])
@@ -294,14 +385,14 @@ class OrganizerTests(unittest.TestCase):
             result = run(link, check=False)
             self.assertNotEqual(result.returncode, 0)
             target_link = self.output / "额外链接"
-            os.symlink(outside, target_link, target_is_directory=True)
+            self.make_symlink(outside, target_link, target_is_directory=True)
             try:
                 stats = run(self.root, apply=True)
                 self.assertNotIn("额外链接", [r["Folder"] for r in stats["Statistics"]])
             finally:
                 target_link.unlink()
             (self.output / "word").rmdir()
-            os.symlink(outside, self.output / "word", target_is_directory=True)
+            self.make_symlink(outside, self.output / "word", target_is_directory=True)
             try:
                 rejected = run(self.root, apply=True, check=False)
                 self.assertNotEqual(rejected.returncode, 0)
@@ -315,7 +406,7 @@ class OrganizerTests(unittest.TestCase):
         outside = put(self.temp_path / "external.docx")
         link = self.root / "链接.docx"
         try:
-            os.symlink(outside, link)
+            self.make_symlink(outside, link)
         except OSError as exc:
             self.skipTest(f"Windows file-symlink privilege unavailable: {exc.winerror}")
         try:
@@ -335,4 +426,14 @@ class OrganizerTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    # Policy is a prerequisite; the test harness must not silently relax it.
+    policy = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", "Get-ExecutionPolicy"],
+        capture_output=True, encoding="utf-8", errors="replace", env=POWERSHELL_ENV,
+    )
+    if policy.returncode:
+        sys.exit("Cannot read PowerShell execution policy: " + policy.stderr)
+    if policy.stdout.strip() == "Restricted":
+        sys.exit("Execution policy is Restricted. Tests stopped without changing policy. "
+                 "See README: explicit user approval is required before policy configuration.")
     unittest.main(verbosity=2)

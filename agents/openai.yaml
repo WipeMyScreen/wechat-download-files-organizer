@@ -1,6 +1,6 @@
 interface:
   display_name: "wechat_download_files_organizer"
-  short_description: "归类微信下载文件，保留同名文件并生成数量与 KB 大小统计报告"
+  short_description: "归类微信下载文件，保留同名文件并生成数量与自动换算大小单位的统计报告"
   default_prompt: "使用 $wechat_download_files_organizer 整理微信文件并更新统计报告。"
 
 policy:

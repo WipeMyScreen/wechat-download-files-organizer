@@ -1,4 +1,4 @@
-#requires -Version 7.0
+﻿#requires -Version 5.1
 [CmdletBinding()]
 param(
     [string]$RootPath,
@@ -10,6 +10,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Match redirected output in Git Bash, Python, Codex and Claude Code.
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
 $culture = [Globalization.CultureInfo]::InvariantCulture
 $issues = [Collections.Generic.List[object]]::new()
 $skippedLinks = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -25,6 +28,17 @@ $extensionGroups = [ordered]@{
 $extensionMap = @{}
 foreach ($group in $extensionGroups.Keys) {
     foreach ($extension in $extensionGroups[$group].Split(' ')) { $extensionMap[$extension] = $group }
+}
+
+function Get-NormalizedDirectoryPath([string]$Path) {
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $pathRoot = [IO.Path]::GetPathRoot($fullPath)
+    # Preserve drive and UNC roots; TrimEnd alone would turn C:\ into C:.
+    while ($fullPath.Length -gt $pathRoot.Length -and
+        ($fullPath.EndsWith('\') -or $fullPath.EndsWith('/'))) {
+        $fullPath = $fullPath.Substring(0, $fullPath.Length - 1)
+    }
+    return $fullPath
 }
 
 function Get-BeijingTime {
@@ -79,6 +93,19 @@ function Get-FreeDestination([string]$Directory, [string]$Name) {
     return $candidate
 }
 
+function Format-FileSize([long]$Bytes) {
+    $divisor = 1024.0
+    $unit = 'KB'
+    if ($Bytes -ge 1GB) {
+        $divisor = [double](1GB)
+        $unit = 'GB'
+    } elseif ($Bytes -ge 1MB) {
+        $divisor = [double](1MB)
+        $unit = 'MB'
+    }
+    return ($Bytes / $divisor).ToString('F2', $culture) + ' ' + $unit
+}
+
 function Format-Cell([string]$Text, [int]$Width) {
     $displayWidth = 0
     foreach ($character in $Text.ToCharArray()) {
@@ -96,7 +123,7 @@ if ($ListAccounts) {
         if ([string]::IsNullOrWhiteSpace($documents)) { throw '无法定位文档目录，请通过 -WechatBasePath 指定 xwechat_files 路径。' }
         $WechatBasePath = Join-Path $documents 'xwechat_files'
     }
-    $basePath = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($WechatBasePath))
+    $basePath = Get-NormalizedDirectoryPath $WechatBasePath
     $candidates = [Collections.Generic.List[object]]::new()
     if (Test-Path -LiteralPath $basePath) {
         Assert-PlainDirectory $basePath
@@ -153,7 +180,7 @@ if ([string]::IsNullOrWhiteSpace($RootPath)) {
     throw '未选择微信账号目录。请先用 -ListAccounts 列出账号并询问用户，再通过 -RootPath 指定完整的 msg\file 路径。'
 }
 
-$root = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($RootPath))
+$root = Get-NormalizedDirectoryPath $RootPath
 Assert-PlainDirectory $root
 $output = Join-Path $root '整理归纳'
 $reportPath = Join-Path $output '整理统计.txt'
@@ -168,7 +195,10 @@ if (Test-Path -LiteralPath $reportPath) {
 }
 
 # Serialize runs for this root without creating a lock file during preview.
-$rootHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($root.ToUpperInvariant())))
+$hasher = [Security.Cryptography.SHA256]::Create()
+try {
+    $rootHash = [BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($root.ToUpperInvariant()))).Replace('-', '')
+} finally { $hasher.Dispose() }
 $mutex = [Threading.Mutex]::new($false, "Local\WechatFileOrganizer_$rootHash")
 $acquired = $false
 $statistics = [Collections.Generic.List[object]]::new()
@@ -242,7 +272,7 @@ try {
                 $folderFiles = @(Get-RegularFiles -Path $folder.FullName -Stage 'Statistics')
                 [long]$bytes = 0
                 foreach ($item in $folderFiles) { $bytes += $item.Length }
-                $statistics.Add([pscustomobject]@{ Folder = $name; FileCount = $folderFiles.Count; SizeKB = ($bytes / 1024.0).ToString('F2', $culture); Bytes = $bytes })
+                $statistics.Add([pscustomobject]@{ Folder = $name; FileCount = $folderFiles.Count; SizeKB = ($bytes / 1024.0).ToString('F2', $culture); Size = (Format-FileSize $bytes); Bytes = $bytes })
             }
         } catch { Add-Issue 'Statistics' $output $_.Exception.Message }
         $statisticsComplete = $issues.Count -eq $issueCountBeforeStats
@@ -257,12 +287,12 @@ try {
         [long]$totalFiles = 0
         [long]$totalBytes = 0
         foreach ($row in $statistics) {
-            $lines.Add((Format-Cell $row.Folder 16) + (Format-Cell ("$($row.FileCount) 个") 16) + "$($row.SizeKB) KB")
+            $lines.Add((Format-Cell $row.Folder 16) + (Format-Cell ("$($row.FileCount) 个") 16) + $row.Size)
             $totalFiles += $row.FileCount
             $totalBytes += $row.Bytes
         }
         $lines.Add('--------------------------------------------')
-        $lines.Add((Format-Cell '总计' 16) + (Format-Cell ("$totalFiles 个") 16) + ($totalBytes / 1024.0).ToString('F2', $culture) + ' KB')
+        $lines.Add((Format-Cell '总计' 16) + (Format-Cell ("$totalFiles 个") 16) + (Format-FileSize $totalBytes))
         $lines.Add('')
         $lines.Add('说明：')
         $lines.Add('统计包含子文件夹中的文件。')
@@ -272,7 +302,11 @@ try {
         try {
             Assert-PlainDirectory $output
             [IO.File]::WriteAllLines($temporaryReport, $lines, [Text.UTF8Encoding]::new($true))
-            [IO.File]::Move($temporaryReport, $reportPath, $true)
+            if (Test-Path -LiteralPath $reportPath) {
+                [IO.File]::Replace($temporaryReport, $reportPath, [System.Management.Automation.Language.NullString]::Value)
+            } else {
+                [IO.File]::Move($temporaryReport, $reportPath)
+            }
             $reportWritten = $true
         } catch { Add-Issue 'Report' $reportPath $_.Exception.Message }
         finally { if (Test-Path -LiteralPath $temporaryReport) { Remove-Item -LiteralPath $temporaryReport -Force } }
@@ -293,7 +327,7 @@ try {
         SkippedLinks = @($skippedLinks)
         Failures = $issues.ToArray()
         Records = $records.ToArray()
-        Statistics = @($statistics | Select-Object Folder, FileCount, SizeKB)
+        Statistics = @($statistics | Select-Object Folder, FileCount, SizeKB, Size)
         StatisticsComplete = $(if ($Apply) { $statisticsComplete } else { $null })
         ReportPath = $(if ($reportWritten) { $reportPath } else { $null })
     }
