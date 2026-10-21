@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import unittest
+import unicodedata
 import uuid
 
 POWERSHELL = os.environ.get("WECHAT_TEST_POWERSHELL", "powershell.exe")
@@ -18,14 +19,15 @@ POWERSHELL = os.environ.get("WECHAT_TEST_POWERSHELL", "powershell.exe")
 POWERSHELL_ENV = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "organize.ps1"
-CATEGORIES = ["word", "excel", "ppt", "压缩包", "DWG", "其他"]
+CATEGORIES = ["word", "excel", "ppt", "压缩包", "DWG", "PDF", "其他"]
 EXTENSIONS = {
     "word": ".doc .docx .docm .dot .dotx .dotm .wps .wpt",
     "excel": ".xls .xlsx .xlsm .xlsb .xlt .xltx .xltm .csv .et .ett",
     "ppt": ".ppt .pptx .pptm .pot .potx .potm .pps .ppsx .ppsm .dps .dpt",
     "压缩包": ".zip .rar .7z .tar .gz .tgz .bz2 .xz .zst .cab",
     "DWG": ".dwg",
-    "其他": ".pdf .png .yml .dxf",
+    "PDF": ".pdf",
+    "其他": ".png .yml .dxf",
 }
 
 
@@ -259,7 +261,7 @@ class OrganizerTests(unittest.TestCase):
         self.assertRegex(report, r"统计时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}（北京时间）")
         total_count = sum(expected_counts.values()) + 1
         total_kb = (sum(expected_bytes.values()) + extra.stat().st_size) / 1024
-        self.assertRegex(report, rf"总计\s+{total_count} 个\s+{total_kb:.2f} KB")
+        self.assertRegex(report, rf"总计\s+\|\s+{total_count} 个\s+\|\s+{total_kb:.2f} KB")
         moved_contents = collections.Counter(
             hashlib.sha256(p.read_bytes()).hexdigest()
             for p in self.output.rglob("*") if p.is_file()
@@ -294,12 +296,36 @@ class OrganizerTests(unittest.TestCase):
     def test_empty_run_and_rounded_fractional_kb(self):
         empty = run(self.root, apply=True)
         self.assertTrue(empty["Success"])
-        self.assertEqual(len(empty["Statistics"]), 6)
+        self.assertEqual(len(empty["Statistics"]), len(CATEGORIES))
         self.assertTrue(all(r["FileCount"] == 0 and r["SizeKB"] == "0.00" for r in empty["Statistics"]))
         put(self.root / "fraction.pdf", b"1234567890")
         result = run(self.root, apply=True)
-        other = next(r for r in result["Statistics"] if r["Folder"] == "其他")
-        self.assertEqual(other["SizeKB"], "0.01")
+        pdf = next(r for r in result["Statistics"] if r["Folder"] == "PDF")
+        self.assertEqual(pdf["SizeKB"], "0.01")
+
+    def test_pdf_category_handles_uppercase_duplicates_and_repeated_runs(self):
+        put(self.output / "PDF" / "报告.pdf", b"existing")
+        put(self.root / "一月" / "报告.pdf", b"first")
+        put(self.root / "二月" / "报告.PDF", b"second")
+        before = snapshot(self.root)
+        preview = run(self.root)
+        self.assertTrue(preview["Success"])
+        self.assertEqual(preview["CategoryCounts"]["PDF"], 2)
+        self.assertEqual(before, snapshot(self.root))
+        result = run(self.root, apply=True)
+        self.assertTrue(result["Success"], result["Failures"])
+        self.assertEqual(result["RenamedCount"], 2)
+        self.assertEqual(result["CategoryCounts"]["PDF"], 2)
+        contents = {path.read_bytes() for path in (self.output / "PDF").iterdir()}
+        self.assertEqual(contents, {b"existing", b"first", b"second"})
+        self.assertEqual((self.output / "PDF" / "报告.pdf").read_bytes(), b"existing")
+        self.assertEqual(list((self.output / "其他").iterdir()), [])
+        stats = next(row for row in result["Statistics"] if row["Folder"] == "PDF")
+        self.assertEqual(stats["FileCount"], 3)
+        self.assertRegex(Path(result["ReportPath"]).read_text(encoding="utf-8-sig"), r"PDF\s+\|\s+3 个\s+\|")
+        repeated = run(self.root, apply=True)
+        self.assertEqual(repeated["FileCount"], 0)
+        self.assertEqual(repeated["Statistics"], result["Statistics"])
 
     def test_report_automatically_selects_kb_mb_and_gb(self):
         sizes = {
@@ -308,11 +334,12 @@ class OrganizerTests(unittest.TestCase):
             "ppt": 1024 ** 2,
             "压缩包": 1536 * 1024,
             "DWG": 1023 * 1024 ** 2,
+            "PDF": 0,
             "其他": 1024 ** 3,
         }
         expected = {
             "word": "0.00 KB", "excel": "1023.00 KB", "ppt": "1.00 MB",
-            "压缩包": "1.50 MB", "DWG": "1023.00 MB", "其他": "1.00 GB",
+            "压缩包": "1.50 MB", "DWG": "1023.00 MB", "PDF": "0.00 KB", "其他": "1.00 GB",
         }
         for category, size in sizes.items():
             if size:
@@ -325,8 +352,8 @@ class OrganizerTests(unittest.TestCase):
             with self.subTest(category=category):
                 self.assertEqual(stats[category]["Size"], display)
                 self.assertEqual(stats[category]["SizeKB"], f"{sizes[category] / 1024:.2f}")
-                self.assertRegex(report, rf"(?m)^{re.escape(category)}\s+\d+ 个\s+{re.escape(display)}$")
-        self.assertRegex(report, r"总计\s+5 个\s+2\.00 GB")
+                self.assertRegex(report, rf"(?m)^{re.escape(category)}\s+\|\s+\d+ 个\s+\|\s+{re.escape(display)}$")
+        self.assertRegex(report, r"总计\s+\|\s+5 个\s+\|\s+2\.00 GB")
         self.assertNotIn("字节", report)
 
     def test_total_chooses_its_own_unit_from_original_bytes(self):
@@ -338,14 +365,44 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual(stats["word"]["Size"], "768.00 KB")
         self.assertEqual(stats["excel"]["Size"], "768.00 KB")
         report = Path(result["ReportPath"]).read_text(encoding="utf-8-sig")
-        self.assertRegex(report, r"总计\s+2 个\s+1\.50 MB")
+        self.assertRegex(report, r"总计\s+\|\s+2 个\s+\|\s+1\.50 MB")
         put(self.output / "word" / "一.docx", b"a" * (1024 ** 2))
         put(self.output / "excel" / "二.xlsx", b"b")
         repeated = run(self.root, apply=True)
         self.assertTrue(repeated["Success"])
         changed_report = Path(repeated["ReportPath"]).read_text(encoding="utf-8-sig")
-        self.assertRegex(changed_report, r"总计\s+2 个\s+1\.00 MB")
+        self.assertRegex(changed_report, r"总计\s+\|\s+2 个\s+\|\s+1\.00 MB")
         self.assertEqual(repeated["ReportPath"], result["ReportPath"])
+
+    def test_report_columns_align_for_chinese_long_names_and_different_sizes(self):
+        names = ["很长的自定义资料分类-Quarterly-reports-2026", "资料e\u0301", "📁图纸"]
+        for index, name in enumerate(names):
+            put(self.output / name / "sample.bin", b"x" * (index + 1))
+        for index in range(12):
+            put(self.output / "word" / f"{index}.docx")
+        put(self.output / "excel" / "大文件.xlsx", b"x" * (120 * 1024))
+        result = run(self.root, apply=True)
+        self.assertTrue(result["Success"], result["Failures"])
+        report = Path(result["ReportPath"]).read_text(encoding="utf-8-sig")
+
+        def width(text):
+            return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+
+        rows = [line for line in report.splitlines() if " | " in line]
+        self.assertEqual(len(rows), 1 + len(CATEGORIES) + len(names) + 1)
+        baseline = [width(cell) for cell in rows[0].split(" | ")]
+        for row in rows:
+            cells = row.split(" | ")
+            self.assertEqual([width(cell) for cell in cells], baseline)
+            self.assertFalse(cells[0].startswith(" "))
+            self.assertEqual(cells[1], cells[1].rstrip())
+            self.assertEqual(cells[2], cells[2].rstrip())
+        for name in names:
+            self.assertTrue(any(row.split(" | ")[0].rstrip() == name for row in rows))
+        self.assertIn("新宋体", report)
+        rules = [line for line in report.splitlines() if set(line) <= set("=-+") and line]
+        self.assertTrue(rules)
+        self.assertTrue(all(len(rule) == width(rows[0]) for rule in rules))
 
     def test_locked_source_is_retained_and_report_counts_actual_files(self):
         blocked = put(self.root / "月份" / "占用.docx", b"locked")
@@ -355,7 +412,7 @@ class OrganizerTests(unittest.TestCase):
         self.assertFalse(result["Success"])
         self.assertEqual(result["FailedCount"], 1)
         self.assertTrue(blocked.exists())
-        self.assertTrue((self.output / "其他" / "正常.pdf").exists())
+        self.assertTrue((self.output / "PDF" / "正常.pdf").exists())
         self.assertEqual(sum(r["FileCount"] for r in result["Statistics"]), 1)
         self.assertTrue(Path(result["ReportPath"]).exists())
         self.assertTrue(any(r["Status"] == "Failed" and r["Error"] for r in result["Records"]))

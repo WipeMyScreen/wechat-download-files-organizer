@@ -17,13 +17,14 @@ $culture = [Globalization.CultureInfo]::InvariantCulture
 $issues = [Collections.Generic.List[object]]::new()
 $skippedLinks = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $records = [Collections.Generic.List[object]]::new()
-$categories = @('word', 'excel', 'ppt', '压缩包', 'DWG', '其他')
+$categories = @('word', 'excel', 'ppt', '压缩包', 'DWG', 'PDF', '其他')
 $extensionGroups = [ordered]@{
     word = '.doc .docx .docm .dot .dotx .dotm .wps .wpt'
     excel = '.xls .xlsx .xlsm .xlsb .xlt .xltx .xltm .csv .et .ett'
     ppt = '.ppt .pptx .pptm .pot .potx .potm .pps .ppsx .ppsm .dps .dpt'
     '压缩包' = '.zip .rar .7z .tar .gz .tgz .bz2 .xz .zst .cab'
     DWG = '.dwg'
+    PDF = '.pdf'
 }
 $extensionMap = @{}
 foreach ($group in $extensionGroups.Keys) {
@@ -106,12 +107,55 @@ function Format-FileSize([long]$Bytes) {
     return ($Bytes / $divisor).ToString('F2', $culture) + ' ' + $unit
 }
 
-function Format-Cell([string]$Text, [int]$Width) {
+function Get-DisplayWidth([string]$Text) {
     $displayWidth = 0
-    foreach ($character in $Text.ToCharArray()) {
-        if ([int]$character -ge 0x2e80 -and [int]$character -le 0xffef) { $displayWidth += 2 } else { $displayWidth++ }
+    $elements = [Globalization.StringInfo]::GetTextElementEnumerator($Text)
+    while ($elements.MoveNext()) {
+        $element = $elements.GetTextElement()
+        $code = [char]::ConvertToUtf32($element, 0)
+        $category = [Globalization.CharUnicodeInfo]::GetUnicodeCategory($element, 0)
+        if ($category -in @([Globalization.UnicodeCategory]::NonSpacingMark, [Globalization.UnicodeCategory]::EnclosingMark, [Globalization.UnicodeCategory]::Format)) { continue }
+        if (($code -ge 0x1100 -and $code -le 0x115f) -or
+            ($code -ge 0x2e80 -and $code -le 0xa4cf) -or
+            ($code -ge 0xac00 -and $code -le 0xd7a3) -or
+            ($code -ge 0xf900 -and $code -le 0xfaff) -or
+            ($code -ge 0xfe10 -and $code -le 0xfe6f) -or
+            ($code -ge 0xff01 -and $code -le 0xff60) -or
+            ($code -ge 0xffe0 -and $code -le 0xffe6) -or
+            ($code -ge 0x1f1e6 -and $code -le 0x1faff) -or
+            ($code -ge 0x20000 -and $code -le 0x3fffd)) {
+            $displayWidth += 2
+        } else { $displayWidth++ }
     }
-    return $Text + (' ' * [Math]::Max(2, $Width - $displayWidth))
+    return $displayWidth
+}
+
+function Format-Cell([string]$Text, [int]$Width, [ValidateSet('Left', 'Right')][string]$Alignment = 'Left') {
+    $padding = ' ' * [Math]::Max(0, $Width - (Get-DisplayWidth $Text))
+    if ($Alignment -eq 'Right') { return $padding + $Text }
+    return $Text + $padding
+}
+
+function Format-ReportTable([object[]]$Rows, [long]$TotalFiles, [string]$TotalSize, [int]$MinimumWidth = 0) {
+    $folderWidth = 12
+    $countWidth = 8
+    $sizeWidth = [Math]::Max(10, (Get-DisplayWidth $TotalSize))
+    $countWidth = [Math]::Max($countWidth, (Get-DisplayWidth "$TotalFiles 个"))
+    foreach ($row in $Rows) {
+        $folderWidth = [Math]::Max($folderWidth, (Get-DisplayWidth $row.Folder))
+        $countWidth = [Math]::Max($countWidth, (Get-DisplayWidth "$($row.FileCount) 个"))
+        $sizeWidth = [Math]::Max($sizeWidth, (Get-DisplayWidth $row.Size))
+    }
+    $tableWidth = $folderWidth + $countWidth + $sizeWidth + 6
+    if ($tableWidth -lt $MinimumWidth) { $folderWidth += $MinimumWidth - $tableWidth }
+    $divider = ('-' * $folderWidth) + '-+-' + ('-' * $countWidth) + '-+-' + ('-' * $sizeWidth)
+    (Format-Cell '文件夹' $folderWidth) + ' | ' + (Format-Cell '文件数量' $countWidth -Alignment Right) + ' | ' + (Format-Cell '文件大小' $sizeWidth -Alignment Right)
+    $divider
+    foreach ($row in $Rows) {
+        (Format-Cell $row.Folder $folderWidth) + ' | ' + (Format-Cell "$($row.FileCount) 个" $countWidth -Alignment Right) + ' | ' + (Format-Cell $row.Size $sizeWidth -Alignment Right)
+    }
+    $divider
+    (Format-Cell '总计' $folderWidth) + ' | ' + (Format-Cell "$TotalFiles 个" $countWidth -Alignment Right) + ' | ' + (Format-Cell $TotalSize $sizeWidth -Alignment Right)
 }
 
 if ($ListAccounts) {
@@ -276,28 +320,28 @@ try {
             }
         } catch { Add-Issue 'Statistics' $output $_.Exception.Message }
         $statisticsComplete = $issues.Count -eq $issueCountBeforeStats
-        $lines = [Collections.Generic.List[string]]::new()
-        $lines.Add('微信文件整理统计')
-        $lines.Add('============================================')
-        $lines.Add(('统计时间：{0}（北京时间）' -f (Get-BeijingTime)))
-        if (-not $statisticsComplete) { $lines.Add('注意：部分目录读取失败，以下统计不完整。') }
-        $lines.Add('')
-        $lines.Add((Format-Cell '文件夹' 16) + (Format-Cell '文件数量' 16) + '文件大小')
-        $lines.Add('--------------------------------------------')
         [long]$totalFiles = 0
         [long]$totalBytes = 0
         foreach ($row in $statistics) {
-            $lines.Add((Format-Cell $row.Folder 16) + (Format-Cell ("$($row.FileCount) 个") 16) + $row.Size)
             $totalFiles += $row.FileCount
             $totalBytes += $row.Bytes
         }
-        $lines.Add('--------------------------------------------')
-        $lines.Add((Format-Cell '总计' 16) + (Format-Cell ("$totalFiles 个") 16) + (Format-FileSize $totalBytes))
+        $timestampLine = '统计时间：{0}（北京时间）' -f (Get-BeijingTime)
+        $table = @(Format-ReportTable -Rows $statistics.ToArray() -TotalFiles $totalFiles -TotalSize (Format-FileSize $totalBytes) -MinimumWidth (Get-DisplayWidth $timestampLine))
+        $outerDivider = '=' * (Get-DisplayWidth $table[0])
+        $lines = [Collections.Generic.List[string]]::new()
+        $lines.Add('微信文件整理统计')
+        $lines.Add($outerDivider)
+        $lines.Add($timestampLine)
+        if (-not $statisticsComplete) { $lines.Add('注意：部分目录读取失败，以下统计不完整。') }
+        $lines.Add('')
+        $lines.AddRange([string[]]$table)
         $lines.Add('')
         $lines.Add('说明：')
         $lines.Add('统计包含子文件夹中的文件。')
         $lines.Add('本报告不计入统计。')
-        $lines.Add('============================================')
+        $lines.Add('建议使用等宽字体（如新宋体）查看本表。')
+        $lines.Add($outerDivider)
         $temporaryReport = Join-Path $output ('.统计_' + [Guid]::NewGuid().ToString('N') + '.tmp')
         try {
             Assert-PlainDirectory $output
