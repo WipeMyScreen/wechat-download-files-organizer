@@ -31,8 +31,12 @@ EXTENSIONS = {
 }
 
 
-def run(root, apply=False, check=True):
-    args = [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT), "-RootPath", str(root), "-AsJson"]
+def run(root, apply=False, check=True, include_records=False, as_json=True):
+    args = [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT), "-RootPath", str(root)]
+    if as_json:
+        args.append("-AsJson")
+    if include_records:
+        args.append("-IncludeRecords")
     if apply:
         args.append("-Apply")
     result = subprocess.run(args, capture_output=True, encoding="utf-8", env=POWERSHELL_ENV)
@@ -40,7 +44,7 @@ def run(root, apply=False, check=True):
         return result
     if result.returncode:
         raise AssertionError(result.stderr)
-    return json.loads(result.stdout)
+    return json.loads(result.stdout) if as_json else result.stdout
 
 
 def discover(base, *extra):
@@ -94,7 +98,8 @@ class ExclusiveFile:
                                             ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
         self.kernel.CreateFileW.restype = ctypes.c_void_p
         self.kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-        self.handle = self.kernel.CreateFileW(str(self.path), 0x80000000, 0, None, 3, 0x80, None)
+        flags = 0x02000000 if self.path.is_dir() else 0x80  # FILE_FLAG_BACKUP_SEMANTICS for directories
+        self.handle = self.kernel.CreateFileW(str(self.path), 0x80000000, 0, None, 3, flags, None)
         if self.handle == ctypes.c_void_p(-1).value:
             raise ctypes.WinError(ctypes.get_last_error())
         return self
@@ -216,6 +221,44 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual(preview["CategoryCounts"], applied["CategoryCounts"])
         self.assertTrue((self.root / "2026-01" / "深层").is_dir())
         self.assertTrue((self.output / "其他" / "根文件").exists())
+
+    def test_json_records_are_opt_in_and_leave_summary_unchanged(self):
+        source = put(self.root / "月份" / "同名.docx", b"new")
+        put(self.output / "word" / "同名.docx", b"existing")
+        before = snapshot(self.root)
+        summary = run(self.root)
+        detailed = run(self.root, include_records=True)
+        self.assertNotIn("Records", summary)
+        records = detailed.pop("Records")
+        self.assertEqual(summary, detailed)
+        self.assertEqual(before, snapshot(self.root))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["Source"], str(source))
+        self.assertEqual(records[0]["Status"], "Planned")
+        self.assertTrue(records[0]["Renamed"])
+
+        applied = run(self.root, apply=True, include_records=True)
+        self.assertEqual(applied["Records"][0]["Status"], "Moved")
+        self.assertEqual(applied["Records"][0]["Destination"], records[0]["Destination"])
+        self.assertEqual(summary["CategoryCounts"], applied["CategoryCounts"])
+        self.assertNotIn("Records", run(self.root, apply=True))
+        self.assertEqual(run(self.root, include_records=True)["Records"], [])
+
+    def test_text_records_are_opt_in_for_preview_and_apply(self):
+        source = put(self.root / "月份" / "报告.docx")
+        summary = run(self.root, as_json=False)
+        detailed = run(self.root, as_json=False, include_records=True)
+        self.assertNotIn(str(source), summary)
+        self.assertIn("word：1 个", summary)
+        self.assertIn(f"[Planned] {source} -> ", detailed)
+        self.assertEqual(summary, "\n".join(line for line in detailed.splitlines()
+                                         if " -> " not in line) + "\n")
+        applied = run(self.root, apply=True, as_json=False, include_records=True)
+        self.assertIn(f"[Moved] {source} -> ", applied)
+        second = put(self.root / "第二份.docx")
+        applied_summary = run(self.root, apply=True, as_json=False)
+        self.assertNotIn(str(second), applied_summary)
+        self.assertIn("统计报告：", applied_summary)
 
     def test_every_extension_duplicates_statistics_and_repeat(self):
         expected_counts = {}
@@ -409,13 +452,17 @@ class OrganizerTests(unittest.TestCase):
         put(self.root / "月份" / "正常.pdf", b"x" * 2048)
         with ExclusiveFile(blocked):
             result = run(self.root, apply=True)
+            detailed = run(self.root, apply=True, include_records=True)
         self.assertFalse(result["Success"])
         self.assertEqual(result["FailedCount"], 1)
         self.assertTrue(blocked.exists())
         self.assertTrue((self.output / "PDF" / "正常.pdf").exists())
         self.assertEqual(sum(r["FileCount"] for r in result["Statistics"]), 1)
         self.assertTrue(Path(result["ReportPath"]).exists())
-        self.assertTrue(any(r["Status"] == "Failed" and r["Error"] for r in result["Records"]))
+        self.assertNotIn("Records", result)
+        self.assertTrue(any(i["Stage"] == "Move" and i["Path"] == str(blocked) and i["Message"]
+                            for i in result["Failures"]))
+        self.assertTrue(any(r["Status"] == "Failed" and r["Error"] for r in detailed["Records"]))
         self.assertFalse(list(self.output.glob("移动记录_*.csv")))
 
     def test_locked_report_is_reported_as_failure(self):
@@ -426,6 +473,18 @@ class OrganizerTests(unittest.TestCase):
         self.assertIsNone(result["ReportPath"])
         self.assertTrue(any(i["Stage"] == "Report" for i in result["Failures"]))
         self.assertFalse(list(self.output.glob(".统计_*.tmp")))
+
+    def test_unreadable_statistics_directory_marks_report_incomplete(self):
+        blocked = put(self.output / "暂不可读" / "资料.bin", b"blocked").parent
+        put(self.root / "正常.docx", b"visible")
+        with ExclusiveFile(blocked):
+            result = run(self.root, apply=True)
+        self.assertFalse(result["Success"])
+        self.assertFalse(result["StatisticsComplete"])
+        self.assertTrue(any(i["Stage"] == "Statistics" for i in result["Failures"]))
+        self.assertIn("统计不完整", Path(result["ReportPath"]).read_text(encoding="utf-8-sig"))
+        self.assertTrue((blocked / "资料.bin").exists())
+        self.assertTrue((self.output / "word" / "正常.docx").exists())
 
     def test_directory_links_are_skipped_and_linked_target_is_rejected(self):
         outside = self.temp_path / "outside"
@@ -471,6 +530,26 @@ class OrganizerTests(unittest.TestCase):
             self.assertEqual(result["FileCount"], 0)
             self.assertIn(str(link), result["SkippedLinks"])
             self.assertTrue(outside.exists())
+        finally:
+            link.unlink()
+
+    def test_selected_root_and_discovery_reject_linked_ancestors(self):
+        outside = self.temp_path / "outside"
+        source = put(outside / "account" / "msg" / "file" / "原件.docx")
+        link = self.temp_path / "linked-base"
+        self.make_symlink(outside, link, target_is_directory=True)
+        try:
+            selected = link / "account" / "msg" / "file"
+            rejected = run(selected, apply=True, check=False)
+            self.assertNotEqual(rejected.returncode, 0)
+            result = subprocess.run(
+                [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT),
+                 "-ListAccounts", "-WechatBasePath", str(link / "account"), "-AsJson"],
+                capture_output=True, encoding="utf-8", env=POWERSHELL_ENV,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(source.exists())
+            self.assertFalse((source.parent / "整理归纳").exists())
         finally:
             link.unlink()
 

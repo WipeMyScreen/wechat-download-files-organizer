@@ -5,7 +5,8 @@ param(
     [switch]$ListAccounts,
     [string]$WechatBasePath,
     [switch]$Apply,
-    [switch]$AsJson
+    [switch]$AsJson,
+    [switch]$IncludeRecords
 )
 
 Set-StrictMode -Version Latest
@@ -46,11 +47,12 @@ function Get-BeijingTime {
     [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow, 'China Standard Time').ToString('yyyy-MM-dd HH:mm:ss', $culture)
 }
 
-function Assert-PlainDirectory([string]$Path) {
+function Assert-PlainDirectory([string]$Path, [switch]$CheckParents) {
     $item = Get-Item -LiteralPath $Path -Force
     if (-not $item.PSIsContainer) { throw "不是文件夹：$Path" }
     while ($null -ne $item) {
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "不能通过目录链接访问：$($item.FullName)" }
+        if (-not $CheckParents) { break }
         $item = $item.Parent
     }
 }
@@ -170,7 +172,7 @@ if ($ListAccounts) {
     $basePath = Get-NormalizedDirectoryPath $WechatBasePath
     $candidates = [Collections.Generic.List[object]]::new()
     if (Test-Path -LiteralPath $basePath) {
-        Assert-PlainDirectory $basePath
+        Assert-PlainDirectory $basePath -CheckParents
         $accounts = @(Get-ChildItem -LiteralPath $basePath -Directory -Force | Sort-Object Name)
         :accountLoop foreach ($account in $accounts) {
             # Walk only the known account/msg/file shape, never enumerate users' files.
@@ -225,7 +227,7 @@ if ([string]::IsNullOrWhiteSpace($RootPath)) {
 }
 
 $root = Get-NormalizedDirectoryPath $RootPath
-Assert-PlainDirectory $root
+Assert-PlainDirectory $root -CheckParents
 $output = Join-Path $root '整理归纳'
 $reportPath = Join-Path $output '整理统计.txt'
 foreach ($directory in @($output) + @($categories | ForEach-Object { Join-Path $output $_ })) {
@@ -272,23 +274,12 @@ try {
             $targetDirectory = Join-Path $output $category
             $destination = Get-FreeDestination $targetDirectory $file.Name
             if ($Apply) {
-                Assert-PlainDirectory $file.DirectoryName
-                Assert-PlainDirectory $targetDirectory
                 $current = Get-Item -LiteralPath $file.FullName -Force
                 if ($current.PSIsContainer -or ($current.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
                     throw '源文件已变成文件夹或链接，已跳过。'
                 }
-                while ($true) {
-                    try {
-                        # The two-argument overload never overwrites an existing file.
-                        [IO.File]::Move($file.FullName, $destination)
-                        break
-                    } catch [IO.IOException] {
-                        if ((Test-Path -LiteralPath $destination) -and (Test-Path -LiteralPath $file.FullName)) {
-                            $destination = Get-FreeDestination $targetDirectory $file.Name
-                        } else { throw }
-                    }
-                }
+                # The two-argument overload never overwrites an existing file.
+                [IO.File]::Move($file.FullName, $destination)
                 $record.Status = 'Moved'
             }
             [void]$reserved.Add($destination)
@@ -370,17 +361,18 @@ try {
         FailedCount = @($records | Where-Object Status -eq 'Failed').Count
         SkippedLinks = @($skippedLinks)
         Failures = $issues.ToArray()
-        Records = $records.ToArray()
         Statistics = @($statistics | Select-Object Folder, FileCount, SizeKB, Size)
         StatisticsComplete = $(if ($Apply) { $statisticsComplete } else { $null })
         ReportPath = $(if ($reportWritten) { $reportPath } else { $null })
     }
+    if ($IncludeRecords) { $result | Add-Member -NotePropertyName Records -NotePropertyValue $records.ToArray() }
     if ($AsJson) { $result | ConvertTo-Json -Depth 8 }
     else {
         if ($Apply) { '整理完成（请检查下列失败信息）。' } else { '只读预览：未移动文件，未写入目录或报告。' }
         foreach ($category in $categories) { '{0}：{1} 个' -f $category, $categoryCounts[$category] }
         '重命名：{0} 个；移动失败：{1} 个；跳过链接：{2} 个' -f $result.RenamedCount, $result.FailedCount, $skippedLinks.Count
-        if (-not $Apply) { foreach ($record in $records) { '{0} -> {1}' -f $record.Source, $record.Destination } }
+        if ($IncludeRecords) { foreach ($record in $records) { '[{0}] {1} -> {2}' -f $record.Status, $record.Source, $record.Destination } }
+        foreach ($link in $skippedLinks) { '跳过链接：{0}' -f $link }
         foreach ($issue in $issues) { '[{0}] {1}：{2}' -f $issue.Stage, $issue.Path, $issue.Message }
         if ($reportWritten) { "统计报告：$reportPath" }
     }

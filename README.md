@@ -1,45 +1,39 @@
 # wechat_download_files_organizer
 
-一个非常小的skill, 用于整理 Windows 的微信APP下载的文件。
+一个非常小的skill,  用于整理 Windows 的微信APP下载的文件。
 
-在当前 Windows 用户的文档目录下查找 `xwechat_files\<账号文件夹>\msg\file`, 然后把微信下载的文件,移动到\msg\file\整理归纳这个文件夹内,  "整理归纳"文件夹是skill执行时新增的,里面包含 `word`、`excel`、`ppt`、`压缩包`、`DWG`、`PDF`、`其他`这7个文件夹
+1. 在当前 Windows 用户的文档目录下查找 `xwechat_files\<账号文件夹>\msg\file`, 也可直接指定文件目录
+2. 如果电脑里登陆过多个微信, Agent会先询问要操作哪个微信号
+3. Agent会先询问用户, 是进行预览, 还是进行移动操作.
+4. 如果用户确定移动, 则把微信下载的文件, 移动到\msg\file\整理归纳,  其中 "整理归纳"文件夹是本skill新增的, 里面包含 `word`、`excel`、`ppt`、`压缩包`、`DWG`、`PDF`、`其他`这7个文件夹. 同名文件会自动编号(后面新增数字).
+5.  生成包含文件数量与大小的.txt 统计报告。
 
-同时生成包含文件数量与大小的.txt 统计报告，大小自动选择 KB、MB 或 GB。
+> 注意, 当执行本skill后, 由于文件移动了位置, 则在微信聊天窗口中点击别人发的文件时, 不像往常一样直接打开文件. 而是提示未下载, 需要重新下载.
 
-支持先预览再整理；同名文件自动编号(后面新增数字)，保留全部文件。
+## 工作流程
 
-## 功能
+```mermaid
+flowchart TD
+    A["用户调用 skill"] --> B["确定本次微信账号与文件目录"]
+    B -->|目录已确认| C{"询问用户：只读预览还是正式移动？"}
+    B -->|取消| Z["结束"]
+    C -->|尚未回答| W["等待用户选择，不执行操作"]
+    W -->|用户回答| C
+    C -->|取消| Z
 
-- 查找当前 Windows 用户文档目录下的微信账号文件夹，由用户选择本次要整理的账号；也可直接指定文件目录。
-- 递归扫描源目录，按扩展名分类，不保留原有月份或子目录层级。
-- 默认只读预览；使用 `-Apply` 才实际移动文件并写入报告。
-- 同名文件追加 ` (1)`、` (2)` 等编号，避免覆盖。
-- 跳过文件和目录链接，保留源目录中的空文件夹。
-- 单个文件移动失败时保留源文件并继续，结果中返回失败原因。
-- 统计分类目录及用户新增目录中的文件数量和大小，时间采用北京时间。
+    C -->|只读预览| P["只读扫描并计算分类<br/>不移动文件，不创建目录或报告"]
+    P --> Q["汇报预计分类数量、重命名及问题"]
+    Q --> Z
+    Q -.->|用户随后明确要求移动同一目录| M
 
-## 环境要求
-
-| 环境 | 要求 |
-| --- | --- |
-| 操作系统 | Windows |
-| 执行环境 | Windows 自带的 Windows PowerShell 5.1，或 PowerShell 7；无需额外安装 7 |
-| AI 工具 | Windows 本机的 Codex 或 Claude Code；直接运行脚本不需要 AI 工具 |
-| 脚本执行策略 | 必须允许该脚本执行；Windows 客户端默认 Restricted 会阻止 `.ps1`，见下方处理说明 |
-| 文件权限 | 预览需要读取权限；正式整理需要源目录及目标目录的相应读写权限 |
-| Python | 仅运行测试时需要 Python 3，日常整理不需要 |
-
-可以通过以下命令检查 PowerShell 版本：
-
-```powershell
-powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion'
+    C -->|正式移动| M["扫描源目录<br/>排除整理归纳，跳过文件与目录链接"]
+    M --> N["按扩展名移动到七类文件夹<br/>同名自动编号，不覆盖<br/>单个文件失败时记录原因并继续"]
+    N --> S["统计整理归纳下各子文件夹<br/>更新整理统计.txt"]
+    S --> R["汇报移动数量、重命名、失败与跳过情况<br/>返回报告位置；统计不完整或写入失败时明确说明"]
+    R --> Z
 ```
 
-脚本通过本地文件系统操作文件，不需要微信登录接口或 API 密钥。
-
-Windows 11 自带的是 Windows PowerShell 5.1（`powershell.exe`），PowerShell 7（`pwsh.exe`）需另外安装，二者可并存，见 [Microsoft 官方说明](https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows)。本包兼容两者，不依赖某个 AI 工具附带的私有运行时。
-
-保留 `scripts/organize.ps1` 的 UTF-8 BOM；不要另存为无 BOM 的 UTF-8 或 ANSI。脚本的控制台输出和统计报告均显式使用 UTF-8。默认调用不修改或覆盖 PowerShell 执行策略。运行时兼容与脚本执行权限是独立的前提。
+选择预览后不会自动转为移动；图中的虚线仅表示用户后续明确要求移动时的流程。操作选择由 agent 询问，脚本本身不弹出确认。
 
 ## 安装到 Codex 或 Claude Code
 
@@ -73,15 +67,17 @@ Windows 11 自带的是 Windows PowerShell 5.1（`powershell.exe`），PowerShel
 
 如果工具没有显示新安装或更新的 skill，请重新启动对应工具或新建会话。
 
-## 在 Claude Code 中使用
+## 在 Claude Code 中使用(尚未测试)
 
-输入 `/wechat_download_files_organizer`，或附上“预览微信文件，先不要移动文件”。未指定目录时，会先列出候选账号并等待选择。
+输入 `/wechat_download_files_organizer`，或附上“预览微信文件，先不要移动文件”。未指定目录时，会先列出候选账号并等待选择；目录确定后，再询问本次进行只读预览还是正式移动。
 
 本包用 Windows 自带的 `powershell.exe` 执行，无需 `pwsh`。Claude Code 使用 Git Bash 时，调用参数相同；若 PATH 中找不到 `powershell.exe`，可使用 `"${SYSTEMROOT:-C:/Windows}/System32/WindowsPowerShell/v1.0/powershell.exe"`。
 
+PowerShell 中调用带引号的可执行文件路径时，前面加 `&`，例如 `& "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe"`；Git Bash 中直接执行带引号的路径，不加 `&`。文件路径含空格或中文时须加引号。
+
 若会话的访问控制阻止读取或执行用户级 skill 目录，按工具提示授予该目录的访问权限，或把同一完整文件夹放到项目的 `.claude/skills/` 下。不要以安装 PowerShell 或改用其他脚本替代目录权限问题。
 
-## 在 Codex 中使用
+## 在 Codex 中使用(已多次成功测试)
 
 此 skill 当前配置为显式调用，请在对话框中按$符号, 主动调用 `$wechat_download_files_organizer`。
 
@@ -101,11 +97,15 @@ Windows 11 自带的是 Windows PowerShell 5.1（`powershell.exe`），PowerShel
 
 也可以在请求中直接给出要整理的 `msg\file` 完整路径。微信文件保存在自定义位置时，请提供实际路径。
 
-请求“整理”会授权实际移动文件；请求“预览”只读取文件。安装或修改 skill 本身不会触发整理。
+账号或目录确定后，agent 会再次询问：
+
+> 本次要进行“只读预览”（不移动、不写报告），还是“正式移动”（分类移动并更新统计报告）？
+
+即使最初说了“整理”，或直接给出完整路径，也会等待这次操作选择。选择预览后只汇报预览结果，不自动接着移动；之后明确要求移动同一目录时才执行。尚未回答或取消时，不运行预览或移动。安装或修改 skill 本身不会触发整理。
 
 ## 直接运行脚本
 
-以下命令均在本仓库根目录（即 `SKILL.md` 所在目录）执行。先将路径占位符替换为本机实际目录。
+以下命令均在本仓库根目录（即 `SKILL.md` 所在目录）执行。先将路径占位符替换为本机实际目录。上述交互确认由 agent 负责；直接在终端运行脚本时，仍由 `-Apply` 决定是否移动，脚本不额外弹出询问。
 
 ### 1. 列出候选账号
 
@@ -136,6 +136,24 @@ powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPa
 ```
 
 `-AsJson` 可省略，省略后输出可读文本。`-ListAccounts` 不能与 `-RootPath` 或 `-Apply` 同时使用；`-WechatBasePath` 仅用于列出账号。预览和正式整理都必须明确提供 `-RootPath`。
+
+### 4. 按需查看逐文件明细
+
+默认 JSON 返回分类数量、重命名数、失败详情、跳过链接、统计及报告位置，不包含 `Records`。默认文本也只输出汇总、失败和跳过链接情况。
+
+预览完整明细：
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -AsJson -IncludeRecords
+```
+
+正式整理并返回完整明细：
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -Apply -AsJson -IncludeRecords
+```
+
+`-IncludeRecords` 使 JSON 增加 `Records` 数组；可读文本则逐条显示状态、源路径和目标路径。它只控制输出，不改变分类、移动或统计行为，失败原因始终返回。依赖旧版 `Records` 字段的调用方须添加此参数；不生成额外日志文件。
 
 ## 文件分类
 
@@ -204,7 +222,7 @@ PDF               |    10 个 |   20.00 MB
 =========================================
 ```
 
-本次运行不生成移动记录 CSV，也不删除已有历史 CSV。示例中排除的移动记录指 `整理归纳` 根目录中已有的历史记录；普通 CSV 文件仍归入 `excel` 并计入统计。
+本次运行不生成移动记录 CSV，也不删除已有历史 CSV；普通 CSV 文件仍归入 `excel` 并计入统计。
 
 若目录读取失败，报告会标注统计不完整。请检查运行结果中的失败信息；JSON 结果的 `Success=false` 表示存在失败，报告写入失败也会在结果中反映。
 
@@ -213,6 +231,29 @@ PDF               |    10 个 |   20.00 MB
 - 正式整理会实际移动文件。移动后，微信原聊天记录中的文件入口可能无法按原路径打开，可从 `整理归纳` 中打开文件。
 - 分类后不保留原有月份或子目录层级。需要保留原始结构时，请先自行备份。
 - 文件被其他程序占用或权限不足时可能移动失败，请检查结果后再处理。
+
+## 环境要求
+
+| 环境         | 要求                                                         |
+| ------------ | ------------------------------------------------------------ |
+| 操作系统     | Windows                                                      |
+| 执行环境     | Windows 自带的 Windows PowerShell 5.1，或 PowerShell 7；无需额外安装 7 |
+| AI 工具      | Windows 本机的 Codex 或 Claude Code；直接运行脚本不需要 AI 工具 |
+| 脚本执行策略 | 必须允许该脚本执行；Windows 客户端默认 Restricted 会阻止 `.ps1`，见下方处理说明 |
+| 文件权限     | 预览需要读取权限；正式整理需要源目录及目标目录的相应读写权限 |
+| Python       | 仅运行测试时需要 Python 3，日常整理不需要                    |
+
+可以通过以下命令检查 PowerShell 版本：
+
+```powershell
+powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion'
+```
+
+脚本通过本地文件系统操作文件，不需要微信登录接口或 API 密钥。
+
+Windows 11 自带的是 Windows PowerShell 5.1（`powershell.exe`），PowerShell 7（`pwsh.exe`）需另外安装，二者可并存，见 [Microsoft 官方说明](https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows)。本包兼容两者，不依赖某个 AI 工具附带的私有运行时。
+
+保留 `scripts/organize.ps1` 的 UTF-8 BOM；不要另存为无 BOM 的 UTF-8 或 ANSI。脚本的控制台输出和统计报告均显式使用 UTF-8。默认调用不修改或覆盖 PowerShell 执行策略。运行时兼容与脚本执行权限是独立的前提。
 
 ## 项目文件
 
@@ -257,6 +298,6 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 从浏览器下载的 ZIP 或脚本可能带 Internet 来源标记；即使使用 `RemoteSigned`，也不能承诺任何下载来源都可直接运行。遇到签名或来源限制时，检查来源和组织要求，不自动解除阻止。
 
-Claude 自动模式若拒绝执行策略调整，应明确报告拒绝原因并等待用户授权或由用户手动完成配置，不用延时重试、内联/编码执行或切换解释器避开拦截。脚本被系统阻止时，脚本内的 UTF-8 输出设置尚未运行，因此错误中文可能乱码；`UnauthorizedAccess` 仍可用于辨认失败类型。
+Claude 自动模式检查无结果或拒绝时，明确报告受限动作和原因，不延时或改写命令反复重试，也不放宽工具权限；执行策略调整需对应授权。脚本被系统阻止时，脚本内的 UTF-8 输出设置尚未运行，因此错误中文可能乱码；`UnauthorizedAccess` 仍可用于辨认失败类型。
 
 官方参考：[Microsoft 执行策略](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies?view=powershell-5.1)、[Claude 自动模式](https://code.claude.com/docs/s/claude-code-auto-mode)。
