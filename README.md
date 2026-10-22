@@ -2,9 +2,9 @@
 
 一个非常小的skill,  用于整理 Windows 的微信APP下载的文件。
 
-1. 在当前 Windows 用户的文档目录下查找 `xwechat_files\<账号文件夹>\msg\file`, 也可直接指定文件目录
+1. 在当前 Windows 用户目录和 Windows 文档目录下查找 `xwechat_files\<账号文件夹>\msg\file`，汇总找到的账号；也可直接指定文件目录
 2. 如果电脑里登陆过多个微信, Agent会先询问要操作哪个微信号
-3. Agent会先询问用户, 是进行预览, 还是进行移动操作.
+3. Agent会先询问用户, 是进行预览, 还是进行移动操作. 预览显示各分类的文件数量、大小和总计，大小自动选择 KB、MB 或 GB。
 4. 如果用户确定移动, 则把微信下载的文件, 移动到\msg\file\整理归纳,  其中 "整理归纳"文件夹是本skill新增的, 里面包含 `word`、`excel`、`ppt`、`压缩包`、`DWG`、`PDF`、`其他`这7个文件夹. 同名文件会自动编号(后面新增数字).
 5.  生成包含文件数量与大小的.txt 统计报告。
 
@@ -14,20 +14,16 @@
 
 ```mermaid
 flowchart TD
-    A["用户调用 skill"] --> B["选择微信账号"]
+    A["用户调用 skill"] --> D["自动查找 xwechat_files<br/>或用户指定路径"]
+    D --> B["手动选择微信账号"]
     B -->|已确认| C{"询问用户：预览 or 正式移动？"}
-    B -->|取消| Z["结束"]
-    C -->|取消| Z
-
     C -->|只读预览| P["只读扫描并计算分类<br/>不移动文件"]
-    P --> Q["显示预计分类后的数量"]
+    P --> Q["显示各分类的文件数量、大小"]
     Q --> Z
     Q -.->|用户明确要求移动| M
-
-    C -->|正式移动| M["扫描源目录"]
-    M --> N["按扩展名移动到7类文件夹<br/>同名自动编号，不覆盖"]
-    N --> S["统计移动后的文件数量、大小<br/>生成.txt"]
-    S --> Z
+    C -->|正式移动| M["按扩展名移动到7类文件夹<br/>同名自动编号"]
+    M --> S["统计移动后的文件数量、大小<br/>生成统计信息.txt"]
+    S --> Z["结束"]
 ```
 
 选择预览后不会自动转为移动；图中的虚线仅表示用户后续明确要求移动时的流程。操作选择由 agent 询问，脚本本身不弹出确认。
@@ -68,13 +64,9 @@ flowchart TD
 
 输入 `/wechat_download_files_organizer`，或附上“预览微信文件，先不要移动文件”。未指定目录时，会先列出候选账号并等待选择；目录确定后，再询问本次进行只读预览还是正式移动。
 
-本包用 Windows 自带的 `powershell.exe` 执行，无需 `pwsh`。Claude Code 使用 Git Bash 时，调用参数相同；若 PATH 中找不到 `powershell.exe`，可使用 `"${SYSTEMROOT:-C:/Windows}/System32/WindowsPowerShell/v1.0/powershell.exe"`。
+如果提示需要权限, 则回复同意Claude Code的需求.
 
-PowerShell 中调用带引号的可执行文件路径时，前面加 `&`，例如 `& "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe"`；Git Bash 中直接执行带引号的路径，不加 `&`。文件路径含空格或中文时须加引号。
-
-若会话的访问控制阻止读取或执行用户级 skill 目录，按工具提示授予该目录的访问权限，或把同一完整文件夹放到项目的 `.claude/skills/` 下。不要以安装 PowerShell 或改用其他脚本替代目录权限问题。
-
-## 在 Codex 中使用(已多次成功测试)
+## 在 Codex 中使用(成功测试)
 
 此 skill 当前配置为显式调用，请在对话框中按$符号, 主动调用 `$wechat_download_files_organizer`。
 
@@ -110,9 +102,16 @@ PowerShell 中调用带引号的可执行文件路径时，前面加 `&`，例�
 powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -ListAccounts -AsJson
 ```
 
-默认搜索当前 Windows 用户文档目录中的 `xwechat_files\<账号文件夹>\msg\file`。发现阶段仅检查账号目录结构，不遍历账号中的文件。
+默认检查以下两个位置，并汇总其中的账号：
 
-指定其他 `xwechat_files` 位置：
+- 当前 Windows 用户目录下的 `xwechat_files`，例如 `C:\Users\用户名\xwechat_files`。
+- Windows 文档目录下的 `xwechat_files`，例如 `C:\Users\用户名\Documents\xwechat_files`；文档目录被重定向时使用系统返回的实际位置。
+
+两处路径相同时只检查一次。两处都有同名账号时保留各自完整路径供用户选择；只有一个候选也须确认。找不到账号时询问实际路径，不全盘搜索。发现阶段仅检查 `<账号文件夹>\msg\file` 结构，不遍历账号中的文件。
+
+JSON 的 `SearchRoots` 列出本次检查的根目录；兼容字段 `SearchRoot` 在只有一个搜索根目录时返回该路径，多个时为 `null`。
+
+指定其他 `xwechat_files` 位置（只检查指定位置，不再检查两个默认位置）：
 
 ```powershell
 powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -ListAccounts -WechatBasePath "<xwechat_files 的完整路径>" -AsJson
@@ -124,7 +123,22 @@ powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -ListAc
 powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -AsJson
 ```
 
-预览不会移动文件，也不会创建分类目录或统计报告。
+预览不会移动文件，也不会创建分类目录或统计报告。结果显示七个分类的文件数量、文件大小及总计；大小仅包含本次待整理文件，不含 `整理归纳` 中已有文件。
+
+各分类和总计分别按真实字节数自动选择 KB、MB 或 GB，按 1024 换算并保留两位小数；空分类显示 `0.00 KB`。总计先累加原始字节数再换算。以下为预览示例：
+
+| 分类 | 文件数量 | 文件大小 |
+| --- | ---: | ---: |
+| word | 2 | 768.00 KB |
+| excel | 1 | 768.00 KB |
+| ppt | 0 | 0.00 KB |
+| 压缩包 | 0 | 0.00 KB |
+| DWG | 0 | 0.00 KB |
+| PDF | 0 | 0.00 KB |
+| 其他 | 0 | 0.00 KB |
+| 总计 | 3 | 1.50 MB |
+
+JSON 的 `Statistics` 返回各分类的 `Folder`、`FileCount`、`Size` 和兼容字段 `SizeKB`，`TotalFiles`、`TotalSize` 返回总计。读取失败时 `StatisticsComplete=false`，必须说明预览统计不完整。
 
 ### 3. 正式整理
 
@@ -187,7 +201,7 @@ msg/file/
 
 统计范围为 `整理归纳` 下所有直接子文件夹中的递归文件，包含已有文件及用户新增目录；空目录显示零，链接跳过。各文件夹和总计分别自动选择大小单位：小于 1 MB 显示 KB，达到 1 MB 且小于 1 GB 显示 MB，达到 1 GB 显示 GB。按 **1 KB = 1024 字节、1 MB = 1024 KB、1 GB = 1024 MB** 换算，保留两位小数，使用文件逻辑大小；空目录显示 `0.00 KB`。总计基于原始字节数独立计算和换算。`整理归纳` 根目录中的文件不计入总计。
 
-JSON 输出新增 `Statistics[].Size`（如 `1.50 GB`），同时保留原有 `SizeKB` 字段，兼容已有调用。
+JSON 的 `Statistics[].Size` 为带单位的大小（如 `1.50 GB`），同时保留原有 `SizeKB` 字段；`TotalFiles`、`TotalSize` 返回总计。正式整理的这些字段统计目标目录中的实际文件，包含已有文件；预览时则仅统计本次待整理文件。
 
 报告保留三列表格，根据中英文显示宽度及实际内容自动调整列宽。文件夹名称左对齐，数量和大小右对齐，用 ` | ` 分隔，分隔线与表格同宽。
 

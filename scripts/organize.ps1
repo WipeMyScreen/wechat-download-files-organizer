@@ -165,13 +165,21 @@ if ($ListAccounts) {
         throw '列出账号不能与 -Apply 或 -RootPath 同时使用。请先选择账号，再执行整理。'
     }
     if ([string]::IsNullOrWhiteSpace($WechatBasePath)) {
+        $userProfileDirectory = [Environment]::GetFolderPath('UserProfile')
         $documents = [Environment]::GetFolderPath('MyDocuments')
-        if ([string]::IsNullOrWhiteSpace($documents)) { throw '无法定位文档目录，请通过 -WechatBasePath 指定 xwechat_files 路径。' }
-        $WechatBasePath = Join-Path $documents 'xwechat_files'
+        $basePaths = @($userProfileDirectory, $documents) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { Join-Path $_ 'xwechat_files' }
+    } else {
+        $basePaths = @($WechatBasePath)
     }
-    $basePath = Get-NormalizedDirectoryPath $WechatBasePath
+    $searchRoots = [Collections.Generic.List[string]]::new()
+    $seenRoots = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $basePaths) {
+        $normalized = Get-NormalizedDirectoryPath $path
+        if ($seenRoots.Add($normalized)) { $searchRoots.Add($normalized) }
+    }
     $candidates = [Collections.Generic.List[object]]::new()
-    if (Test-Path -LiteralPath $basePath) {
+    foreach ($basePath in $searchRoots) {
+        if (-not (Test-Path -LiteralPath $basePath)) { continue }
         Assert-PlainDirectory $basePath -CheckParents
         $accounts = @(Get-ChildItem -LiteralPath $basePath -Directory -Force | Sort-Object Name)
         :accountLoop foreach ($account in $accounts) {
@@ -203,7 +211,8 @@ if ($ListAccounts) {
         Mode = 'SelectAccount'
         Success = ($issues.Count -eq 0)
         SelectionRequired = $true
-        SearchRoot = $basePath
+        SearchRoots = $searchRoots.ToArray()
+        SearchRoot = $(if ($searchRoots.Count -eq 1) { $searchRoots[0] } else { $null })
         CandidateCount = $candidates.Count
         Candidates = $candidates.ToArray()
         SkippedLinks = @($skippedLinks)
@@ -211,7 +220,7 @@ if ($ListAccounts) {
     }
     if ($AsJson) { $discovery | ConvertTo-Json -Depth 6 }
     else {
-        "微信账号目录（搜索位置：$basePath）"
+        '微信账号目录（搜索位置：{0}）' -f ($searchRoots -join '；')
         foreach ($candidate in $candidates) { '{0}：{1}' -f $candidate.AccountFolder, $candidate.RootPath }
         if ($candidates.Count -eq 0) { '未找到有效账号目录，请提供完整的 msg\file 路径，或指定其他 -WechatBasePath。' }
         '请先由用户选择目录，再以 -RootPath 指定完整的 msg\file 路径；未移动或修改任何文件。'
@@ -255,6 +264,8 @@ try {
     if (-not $acquired) { throw '此目录已有整理任务运行，请稍后重试。' }
     $files = @(Get-RegularFiles -Path $root -ExcludedDirectory $output | Sort-Object FullName)
     $reserved = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $previewBytes = @{}
+    foreach ($category in $categories) { $previewBytes[$category] = [long]0 }
     if ($Apply) {
         foreach ($directory in @($output) + @($categories | ForEach-Object { Join-Path $output $_ })) {
             [void][IO.Directory]::CreateDirectory($directory)
@@ -283,6 +294,7 @@ try {
                 $record.Status = 'Moved'
             }
             [void]$reserved.Add($destination)
+            if (-not $Apply) { $previewBytes[$category] += $file.Length }
         } catch {
             $record.Status = 'Failed'
             $record.Error = $_.Exception.Message
@@ -293,6 +305,10 @@ try {
         $records.Add($record)
     }
 
+    $categoryCounts = [ordered]@{}
+    foreach ($category in $categories) {
+        $categoryCounts[$category] = @($records | Where-Object { $_.Category -eq $category -and $_.Status -ne 'Failed' }).Count
+    }
     if ($Apply) {
         $issueCountBeforeStats = $issues.Count
         try {
@@ -311,12 +327,20 @@ try {
             }
         } catch { Add-Issue 'Statistics' $output $_.Exception.Message }
         $statisticsComplete = $issues.Count -eq $issueCountBeforeStats
-        [long]$totalFiles = 0
-        [long]$totalBytes = 0
-        foreach ($row in $statistics) {
-            $totalFiles += $row.FileCount
-            $totalBytes += $row.Bytes
+    } else {
+        foreach ($category in $categories) {
+            [long]$bytes = $previewBytes[$category]
+            $statistics.Add([pscustomobject]@{ Folder = $category; FileCount = $categoryCounts[$category]; SizeKB = ($bytes / 1024.0).ToString('F2', $culture); Size = (Format-FileSize $bytes); Bytes = $bytes })
         }
+        $statisticsComplete = $issues.Count -eq 0
+    }
+    [long]$totalFiles = 0
+    [long]$totalBytes = 0
+    foreach ($row in $statistics) {
+        $totalFiles += $row.FileCount
+        $totalBytes += $row.Bytes
+    }
+    if ($Apply) {
         $timestampLine = '统计时间：{0}（北京时间）' -f (Get-BeijingTime)
         $table = @(Format-ReportTable -Rows $statistics.ToArray() -TotalFiles $totalFiles -TotalSize (Format-FileSize $totalBytes) -MinimumWidth (Get-DisplayWidth $timestampLine))
         $outerDivider = '=' * (Get-DisplayWidth $table[0])
@@ -347,10 +371,6 @@ try {
         finally { if (Test-Path -LiteralPath $temporaryReport) { Remove-Item -LiteralPath $temporaryReport -Force } }
     }
 
-    $categoryCounts = [ordered]@{}
-    foreach ($category in $categories) {
-        $categoryCounts[$category] = @($records | Where-Object { $_.Category -eq $category -and $_.Status -ne 'Failed' }).Count
-    }
     $result = [pscustomobject]@{
         Mode = $(if ($Apply) { 'Apply' } else { 'Preview' })
         Success = ($issues.Count -eq 0)
@@ -362,14 +382,22 @@ try {
         SkippedLinks = @($skippedLinks)
         Failures = $issues.ToArray()
         Statistics = @($statistics | Select-Object Folder, FileCount, SizeKB, Size)
-        StatisticsComplete = $(if ($Apply) { $statisticsComplete } else { $null })
+        StatisticsComplete = $statisticsComplete
+        TotalFiles = $totalFiles
+        TotalSize = Format-FileSize $totalBytes
         ReportPath = $(if ($reportWritten) { $reportPath } else { $null })
     }
     if ($IncludeRecords) { $result | Add-Member -NotePropertyName Records -NotePropertyValue $records.ToArray() }
     if ($AsJson) { $result | ConvertTo-Json -Depth 8 }
     else {
         if ($Apply) { '整理完成（请检查下列失败信息）。' } else { '只读预览：未移动文件，未写入目录或报告。' }
-        foreach ($category in $categories) { '{0}：{1} 个' -f $category, $categoryCounts[$category] }
+        if ($Apply) {
+            foreach ($category in $categories) { '{0}：{1} 个' -f $category, $categoryCounts[$category] }
+        } else {
+            '预计分类（仅本次待整理文件，不含整理归纳中已有文件）：'
+            if (-not $statisticsComplete) { '注意：部分文件或目录处理失败，以下预览统计不完整。' }
+            Format-ReportTable -Rows $statistics.ToArray() -TotalFiles $totalFiles -TotalSize $result.TotalSize
+        }
         '重命名：{0} 个；移动失败：{1} 个；跳过链接：{2} 个' -f $result.RenamedCount, $result.FailedCount, $skippedLinks.Count
         if ($IncludeRecords) { foreach ($record in $records) { '[{0}] {1} -> {2}' -f $record.Status, $record.Source, $record.Destination } }
         foreach ($link in $skippedLinks) { '跳过链接：{0}' -f $link }

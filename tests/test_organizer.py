@@ -129,6 +129,80 @@ class OrganizerTests(unittest.TestCase):
         assert self.temp_path.name.startswith("wechat-organizer-test-")
         shutil.rmtree(self.temp_path)
 
+    def discover_default_locations(self, profile, documents, *extra):
+        # Substitute only the OS folder lookups in a disposable copy; exercise
+        # the real default-discovery branch without reading real WeChat accounts.
+        script = SCRIPT.read_text(encoding="utf-8-sig")
+        for folder, path in [("UserProfile", profile), ("MyDocuments", documents)]:
+            lookup = f"[Environment]::GetFolderPath('{folder}')"
+            self.assertEqual(script.count(lookup), 1)
+            script = script.replace(lookup, "'" + str(path).replace("'", "''") + "'")
+        test_script = self.temp_path / "discover-defaults.ps1"
+        test_script.write_text(script, encoding="utf-8-sig")
+        result = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(test_script),
+             "-ListAccounts", "-AsJson", *extra],
+            capture_output=True, encoding="utf-8", env=POWERSHELL_ENV,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_default_discovery_combines_both_locations_without_selecting(self):
+        profile = self.temp_path / "用户目录"
+        documents = self.temp_path / "重定向文档"
+        roots = [profile / "xwechat_files", documents / "xwechat_files"]
+        files = [put(base / "同名账号" / "msg" / "file" / "原件.docx") for base in roots]
+        before = [snapshot(base) for base in roots]
+        result = self.discover_default_locations(profile, documents)
+        self.assertTrue(result["Success"])
+        self.assertEqual(result["SearchRoots"], [str(base) for base in roots])
+        self.assertIsNone(result["SearchRoot"])
+        self.assertEqual(result["CandidateCount"], 2)
+        self.assertEqual([c["RootPath"] for c in result["Candidates"]], [str(f.parent) for f in files])
+        self.assertTrue(result["SelectionRequired"])
+        self.assertEqual(before, [snapshot(base) for base in roots])
+
+    def test_default_discovery_finds_either_location_alone(self):
+        for location in ["profile", "documents"]:
+            with self.subTest(location=location):
+                profile = self.temp_path / location / "用户"
+                documents = self.temp_path / location / "文档"
+                parent = profile if location == "profile" else documents
+                source = put(parent / "xwechat_files" / "账号" / "msg" / "file" / "资料.pdf")
+                result = self.discover_default_locations(profile, documents)
+                self.assertTrue(result["Success"])
+                self.assertEqual(result["CandidateCount"], 1)
+                self.assertTrue(result["SelectionRequired"])
+                self.assertEqual(result["Candidates"][0]["RootPath"], str(source.parent))
+                missing = documents if location == "profile" else profile
+                self.assertFalse(missing.exists())
+
+    def test_default_discovery_missing_locations_does_not_create_them(self):
+        profile, documents = self.temp_path / "用户", self.temp_path / "文档"
+        result = self.discover_default_locations(profile, documents)
+        self.assertEqual(result["Candidates"], [])
+        self.assertTrue(result["SelectionRequired"])
+        self.assertFalse(profile.exists())
+        self.assertFalse(documents.exists())
+
+    def test_default_discovery_deduplicates_same_location(self):
+        profile = self.temp_path / "用户"
+        put(profile / "xwechat_files" / "账号" / "msg" / "file" / "资料.pdf")
+        result = self.discover_default_locations(profile, str(profile).upper() + "\\")
+        self.assertEqual(result["SearchRoots"], [str(profile / "xwechat_files")])
+        self.assertEqual(result["CandidateCount"], 1)
+
+    def test_explicit_discovery_path_replaces_both_defaults(self):
+        profile, documents = self.temp_path / "用户", self.temp_path / "文档"
+        for parent in [profile, documents]:
+            put(parent / "xwechat_files" / "默认账号" / "msg" / "file" / "资料.pdf")
+        custom = self.temp_path / "自定义存储"
+        source = put(custom / "指定账号" / "msg" / "file" / "资料.pdf")
+        result = self.discover_default_locations(profile, documents, "-WechatBasePath", str(custom))
+        self.assertEqual(result["SearchRoots"], [str(custom)])
+        self.assertEqual(result["SearchRoot"], str(custom))
+        self.assertEqual(result["Candidates"], [{"AccountFolder": "指定账号", "RootPath": str(source.parent)}])
+
     def test_trailing_separators_preserve_paths_and_discovery(self):
         source = put(self.root / "中文.docx")
         result = run(str(self.root) + "\\")
@@ -219,6 +293,8 @@ class OrganizerTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
         applied = run(self.root, apply=True)
         self.assertEqual(preview["CategoryCounts"], applied["CategoryCounts"])
+        self.assertEqual(preview["Statistics"], applied["Statistics"])
+        self.assertEqual(preview["TotalSize"], applied["TotalSize"])
         self.assertTrue((self.root / "2026-01" / "深层").is_dir())
         self.assertTrue((self.output / "其他" / "根文件").exists())
 
@@ -244,12 +320,83 @@ class OrganizerTests(unittest.TestCase):
         self.assertNotIn("Records", run(self.root, apply=True))
         self.assertEqual(run(self.root, include_records=True)["Records"], [])
 
+    def test_preview_sizes_use_kb_mb_gb_without_writing(self):
+        samples = {
+            "word": ("资料.docx", 1023 * 1024, "1023.00 KB"),
+            "excel": ("资料.xlsx", 1024 ** 2, "1.00 MB"),
+            "ppt": ("资料.pptx", 1536 * 1024, "1.50 MB"),
+            "压缩包": ("资料.zip", 1024 ** 3, "1.00 GB"),
+            "DWG": ("资料.dwg", 1024 ** 3 - 1, "1024.00 MB"),
+            "PDF": ("空文件.pdf", 0, "0.00 KB"),
+            "其他": ("零碎字节.bin", 3, "0.00 KB"),
+        }
+        for filename, size, _ in samples.values():
+            put_sparse(self.root / "月份" / filename, size)
+        before = {str(p): (p.stat().st_size, p.stat().st_mtime_ns) for p in self.root.rglob("*")}
+        preview = run(self.root)
+        text = run(self.root, as_json=False)
+        self.assertTrue(preview["Success"])
+        self.assertTrue(preview["StatisticsComplete"])
+        self.assertEqual(preview["TotalFiles"], 7)
+        stats = {row["Folder"]: row for row in preview["Statistics"]}
+        for category, (_, size, display) in samples.items():
+            self.assertEqual(stats[category]["FileCount"], 1)
+            self.assertEqual(stats[category]["Size"], display)
+            self.assertEqual(stats[category]["SizeKB"], f"{size / 1024:.2f}")
+            self.assertRegex(text, rf"{re.escape(category)}\s+\|\s+1 个\s+\|\s+{re.escape(display)}")
+        self.assertEqual(preview["TotalSize"], f"{sum(s[1] for s in samples.values()) / 1024 ** 3:.2f} GB")
+        self.assertRegex(text, r"总计\s+\|\s+7 个\s+\|\s+2\.00 GB")
+        self.assertIsNone(preview["ReportPath"])
+        self.assertFalse(self.output.exists())
+        self.assertEqual(before, {str(p): (p.stat().st_size, p.stat().st_mtime_ns) for p in self.root.rglob("*")})
+
+    def test_preview_total_uses_raw_sizes_and_excludes_already_organized_files(self):
+        put(self.root / "一月" / "同名.docx", b"a" * (768 * 1024))
+        put(self.root / "二月" / "资料.pdf", b"b" * (768 * 1024))
+        put(self.output / "word" / "同名.docx", b"existing")
+        put(self.output / "自定义" / "资料.bin", b"excluded")
+        before = snapshot(self.root)
+        result = run(self.root)
+        self.assertEqual(result["TotalFiles"], 2)
+        self.assertEqual(result["TotalSize"], "1.50 MB")
+        self.assertEqual(result["RenamedCount"], 1)
+        stats = {row["Folder"]: row for row in result["Statistics"]}
+        self.assertEqual(stats["word"]["Size"], "768.00 KB")
+        self.assertEqual(stats["PDF"]["Size"], "768.00 KB")
+        self.assertEqual(stats["excel"]["FileCount"], 0)
+        self.assertEqual(stats["excel"]["Size"], "0.00 KB")
+        self.assertNotIn("自定义", stats)
+        self.assertEqual(before, snapshot(self.root))
+
+    def test_empty_preview_has_seven_zero_rows_and_no_output(self):
+        result = run(self.root)
+        self.assertEqual(result["TotalFiles"], 0)
+        self.assertEqual(result["TotalSize"], "0.00 KB")
+        self.assertTrue(result["StatisticsComplete"])
+        self.assertEqual(len(result["Statistics"]), 7)
+        self.assertTrue(all(r["FileCount"] == 0 and r["Size"] == "0.00 KB" for r in result["Statistics"]))
+        self.assertFalse(self.output.exists())
+
+    def test_preview_marks_unreadable_directory_as_incomplete(self):
+        blocked = put(self.root / "暂不可读" / "资料.pdf", b"hidden").parent
+        put(self.root / "可读.docx", b"x" * 2048)
+        with ExclusiveFile(blocked):
+            result = run(self.root)
+            text = run(self.root, as_json=False)
+        self.assertFalse(result["Success"])
+        self.assertFalse(result["StatisticsComplete"])
+        self.assertEqual(result["TotalFiles"], 1)
+        self.assertEqual(result["TotalSize"], "2.00 KB")
+        self.assertIn("预览统计不完整", text)
+        self.assertTrue(any(i["Stage"] == "Scan" for i in result["Failures"]))
+        self.assertFalse(self.output.exists())
+
     def test_text_records_are_opt_in_for_preview_and_apply(self):
         source = put(self.root / "月份" / "报告.docx")
         summary = run(self.root, as_json=False)
         detailed = run(self.root, as_json=False, include_records=True)
         self.assertNotIn(str(source), summary)
-        self.assertIn("word：1 个", summary)
+        self.assertRegex(summary, r"word\s+\|\s+1 个\s+\|\s+1\.00 KB")
         self.assertIn(f"[Planned] {source} -> ", detailed)
         self.assertEqual(summary, "\n".join(line for line in detailed.splitlines()
                                          if " -> " not in line) + "\n")
