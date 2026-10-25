@@ -19,7 +19,7 @@ POWERSHELL = os.environ.get("WECHAT_TEST_POWERSHELL", "powershell.exe")
 POWERSHELL_ENV = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "organize.ps1"
-CATEGORIES = ["word", "excel", "ppt", "压缩包", "DWG", "PDF", "其他"]
+CATEGORIES = ["word", "excel", "ppt", "压缩包", "DWG", "PDF", "音频", "其他"]
 EXTENSIONS = {
     "word": ".doc .docx .docm .dot .dotx .dotm .wps .wpt",
     "excel": ".xls .xlsx .xlsm .xlsb .xlt .xltx .xltm .csv .et .ett",
@@ -27,11 +27,12 @@ EXTENSIONS = {
     "压缩包": ".zip .rar .7z .tar .gz .tgz .bz2 .xz .zst .cab",
     "DWG": ".dwg",
     "PDF": ".pdf",
+    "音频": ".mp3 .wav .flac .m4a .m4b .aac .ogg .opus .wma .amr .aif .aiff .ape .alac .mid .midi .silk",
     "其他": ".png .yml .dxf",
 }
 
 
-def run(root, apply=False, check=True, include_records=False, as_json=True):
+def run(root, apply=False, check=True, include_records=False, as_json=True, deduplicate=False):
     args = [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT), "-RootPath", str(root)]
     if as_json:
         args.append("-AsJson")
@@ -39,6 +40,8 @@ def run(root, apply=False, check=True, include_records=False, as_json=True):
         args.append("-IncludeRecords")
     if apply:
         args.append("-Apply")
+    if deduplicate:
+        args.append("-Deduplicate")
     result = subprocess.run(args, capture_output=True, encoding="utf-8", env=POWERSHELL_ENV)
     if not check:
         return result
@@ -110,6 +113,7 @@ class ExclusiveFile:
 
 class OrganizerTests(unittest.TestCase):
     def setUp(self):
+        self.restore_recycled = False
         self.temp_path = SCRIPT.parents[2] / ("wechat-organizer-test-" + uuid.uuid4().hex + " 中文 空格")
         self.temp_path.mkdir()
         self.root = self.temp_path / "file"
@@ -127,6 +131,12 @@ class OrganizerTests(unittest.TestCase):
     def tearDown(self):
         assert self.temp_path.resolve().parent == SCRIPT.parents[2].resolve()
         assert self.temp_path.name.startswith("wechat-organizer-test-")
+        if self.restore_recycled:
+            restored = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-File",
+                                       str(SCRIPT.parents[1] / "tests/restore-test-recycle.ps1"),
+                                       "-TestRoot", str(self.temp_path)],
+                                      capture_output=True, encoding="utf-8", env=POWERSHELL_ENV)
+            self.assertEqual(restored.returncode, 0, restored.stderr)
         shutil.rmtree(self.temp_path)
 
     def discover_default_locations(self, profile, documents, *extra):
@@ -363,17 +373,16 @@ class OrganizerTests(unittest.TestCase):
         stats = {row["Folder"]: row for row in result["Statistics"]}
         self.assertEqual(stats["word"]["Size"], "768.00 KB")
         self.assertEqual(stats["PDF"]["Size"], "768.00 KB")
-        self.assertEqual(stats["excel"]["FileCount"], 0)
-        self.assertEqual(stats["excel"]["Size"], "0.00 KB")
+        self.assertNotIn("excel", stats)
         self.assertNotIn("自定义", stats)
         self.assertEqual(before, snapshot(self.root))
 
-    def test_empty_preview_has_seven_zero_rows_and_no_output(self):
+    def test_empty_preview_hides_zero_rows_and_has_no_output(self):
         result = run(self.root)
         self.assertEqual(result["TotalFiles"], 0)
         self.assertEqual(result["TotalSize"], "0.00 KB")
         self.assertTrue(result["StatisticsComplete"])
-        self.assertEqual(len(result["Statistics"]), 7)
+        self.assertEqual(result["Statistics"], [])
         self.assertTrue(all(r["FileCount"] == 0 and r["Size"] == "0.00 KB" for r in result["Statistics"]))
         self.assertFalse(self.output.exists())
 
@@ -483,10 +492,206 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual([p.name for p in self.output.iterdir() if p.is_file()], ["整理统计.txt"])
         self.assertFalse(list(self.output.glob("移动记录_*.csv")))
 
+    def helper(self, body, **data):
+        config = self.temp_path / "helper.json"
+        config.write_text(json.dumps(dict(Script=str(SCRIPT), Root=str(self.root), **data)), encoding="utf-8-sig")
+        script = self.temp_path / "helper.ps1"
+        script.write_text('param([string]$ConfigPath)\n$ErrorActionPreference="Stop"\n'
+                          '[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)\n'
+                          '$cfg=Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json\n'
+                          '. $cfg.Script -ListAccounts -WechatBasePath (Join-Path $cfg.Root "absent") -AsJson | Out-Null\n'
+                          '. (Join-Path (Split-Path -Parent $cfg.Script) "deduplicate.ps1")\n' + body,
+                          encoding="utf-8-sig")
+        response = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(script), str(config)],
+                                  capture_output=True, encoding="utf-8", env=POWERSHELL_ENV)
+        self.assertEqual(response.returncode, 0, response.stderr)
+        return json.loads(response.stdout)
+
+    def test_audio_extensions_and_existing_audio_migration_are_previewed(self):
+        for index, ext in enumerate(EXTENSIONS["音频"].split()):
+            put(self.root / "月份" / f"audio-{index}{ext.upper()}", bytes([index]))
+        old = put(self.output / "其他" / "archive" / "saved.MP3", b"old audio")
+        put(self.output / "音频" / "saved.MP3", b"different")
+        before = snapshot(self.root)
+        preview = run(self.root, deduplicate=True)
+        self.assertTrue(preview["Success"], preview["Failures"])
+        self.assertEqual(preview["CategoryCounts"]["音频"], 18)
+        self.assertEqual(before, snapshot(self.root))
+        result = run(self.root, apply=True)
+        self.assertTrue(result["Success"], result["Failures"])
+        self.assertFalse(old.exists())
+        self.assertEqual((self.output / "音频" / "saved (1).MP3").read_bytes(), b"old audio")
+        self.assertEqual([r["Folder"] for r in result["Statistics"]], ["音频"])
+        self.assertEqual(result["Statistics"][0]["FileCount"], 19)
+        self.assertTrue((self.output / "其他" / "archive").is_dir())
+        self.assertFalse((self.output / "PDF").exists())
+
+    def test_only_empty_builtin_roots_are_removed_and_zero_byte_files_remain(self):
+        (self.output / "word").mkdir(parents=True)
+        (self.output / "PDF" / "empty-child").mkdir(parents=True)
+        (self.output / "custom-empty").mkdir()
+        month = self.root / "empty-month"
+        month.mkdir()
+        put(self.root / "empty.mp3", b"")
+        result = run(self.root, apply=True)
+        self.assertTrue(result["Success"], result["Failures"])
+        self.assertFalse((self.output / "word").exists())
+        self.assertTrue((self.output / "PDF" / "empty-child").exists())
+        self.assertTrue((self.output / "custom-empty").exists())
+        self.assertTrue(month.exists())
+        self.assertEqual(result["Statistics"], [{"Folder": "音频", "FileCount": 1, "SizeKB": "0.00", "Size": "0.00 KB"}])
+        self.assertEqual(len(result["CategoryCounts"]), 8)
+
+    def test_preview_dedup_respects_category_boundary_and_keeps_existing(self):
+        new = put(self.root / "older-new.docx", b"identical")
+        old = put(self.output / "word" / "keep.docx", b"identical")
+        put(self.output / "word" / "copy.docx", b"identical")
+        self.helper("[IO.File]::SetCreationTimeUtc($cfg.Keeper,[datetime]'2000-01-01'); 'true'", Keeper=str(old))
+        put(self.output / "PDF" / "same.pdf", b"identical")
+        put(self.output / "custom" / "one.docx", b"identical")
+        put(self.output / "custom" / "two.docx", b"identical")
+        put(self.output / "root-record.csv", b"identical")
+        put(self.root / "different.docx", b"different")
+        before = snapshot(self.root)
+        preview = run(self.root, deduplicate=True, include_records=True)
+        self.assertTrue(preview["Success"], preview["Failures"])
+        self.assertEqual(preview["DuplicateCount"], 2)
+        self.assertEqual(preview["RecycledCount"], 0)
+        self.assertTrue(preview["DuplicateCheckComplete"])
+        planned = [r for r in preview["Records"] if r["Status"] == "DuplicatePlanned"]
+        self.assertTrue(all(r["KeptPath"] == str(old) for r in planned))
+        self.assertTrue(any(r["Source"] == str(new) for r in planned))
+        self.assertEqual(before, snapshot(self.root))
+        self.assertIsNone(preview["ReportPath"])
+
+    def test_apply_dedup_recycles_history_and_new_copies_and_is_repeatable(self):
+        put(self.root / "oldest-new.docx", b"duplicate data")
+        kept = put(self.output / "word" / "keep.docx", b"duplicate data")
+        put(self.output / "word" / "history-one.docx", b"duplicate data")
+        put(self.output / "word" / "history-two.docx", b"duplicate data")
+        self.helper("[IO.File]::SetCreationTimeUtc($cfg.Keeper,[datetime]'2000-01-01'); 'true'", Keeper=str(kept))
+        put(self.root / "unique.docx", b"unique")
+        self.restore_recycled = True
+        result = run(self.root, apply=True, deduplicate=True, include_records=True)
+        self.assertTrue(result["Success"], result["Failures"])
+        self.assertEqual(result["DuplicateCount"], 3)
+        self.assertEqual(result["RecycledCount"], 3)
+        self.assertEqual(result["TotalFiles"], 2)
+        self.assertEqual(kept.read_bytes(), b"duplicate data")
+        self.assertEqual(len(list((self.output / "word").iterdir())), 2)
+        details = [r for r in result["Records"] if r["Status"] == "Recycled"]
+        self.assertEqual(len(details), 3)
+        self.assertTrue(all(r["KeptPath"] == str(kept) for r in details))
+        report = Path(result["ReportPath"]).read_text(encoding="utf-8-sig")
+        self.assertIn("3 个重复副本移入回收站", report)
+        repeated = run(self.root, apply=True, deduplicate=True)
+        self.assertTrue(repeated["Success"], repeated["Failures"])
+        self.assertEqual(repeated["DuplicateCount"], 0)
+        self.assertEqual(repeated["RecycledCount"], 0)
+        self.assertEqual(result["Statistics"], repeated["Statistics"])
+
+    def test_creation_time_tie_uses_full_path_and_empty_files_are_duplicates(self):
+        a = put(self.output / "word" / "a.docx", b"")
+        z = put(self.output / "word" / "z.docx", b"")
+        self.helper("[IO.File]::SetCreationTimeUtc($cfg.A,[datetime]'2000-01-01'); [IO.File]::SetCreationTimeUtc($cfg.Z,[datetime]'2000-01-01'); 'true'", A=str(a), Z=str(z))
+        result = run(self.root, deduplicate=True, include_records=True)
+        self.assertTrue(result["Success"], result["Failures"])
+        self.assertEqual(result["DuplicateCount"], 1)
+        self.assertEqual(result["DuplicateSize"], "0.00 KB")
+        record = next(r for r in result["Records"] if r["Status"] == "DuplicatePlanned")
+        self.assertEqual(record["KeptPath"], str(a))
+        self.assertEqual(record["Source"], str(z))
+        self.assertTrue(a.exists() and z.exists())
+
+    def test_existing_audio_is_preferred_over_new_duplicate_audio(self):
+        put(self.root / "new.mp3", b"same audio")
+        put(self.output / "其他" / "existing.mp3", b"same audio")
+        self.restore_recycled = True
+        result = run(self.root, apply=True, deduplicate=True, include_records=True)
+        self.assertTrue(result["Success"], result["Failures"])
+        self.assertEqual(result["RecycledCount"], 1)
+        self.assertEqual(result["TotalFiles"], 1)
+        self.assertEqual((self.output / "音频" / "existing.mp3").read_bytes(), b"same audio")
+        self.assertFalse((self.output / "其他").exists())
+        self.assertFalse((self.output / "音频" / "new.mp3").exists())
+
+    def test_unavailable_native_interface_keeps_copies_and_reports_failure(self):
+        kept = put(self.output / "word" / "keep.docx", b"same")
+        copy = put(self.output / "word" / "copy.docx", b"same")
+        package = self.temp_path / "broken-interface-package"
+        shutil.copytree(SCRIPT.parents[1] / "scripts", package)
+        (package / "recycle-native.cs").write_text("invalid C sharp source", encoding="utf-8")
+        response = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(package / "organize.ps1"),
+                                   "-RootPath", str(self.root), "-Apply", "-Deduplicate", "-AsJson"],
+                                  capture_output=True, encoding="utf-8", env=POWERSHELL_ENV)
+        self.assertEqual(response.returncode, 0, response.stderr)
+        result = json.loads(response.stdout)
+        self.assertFalse(result["Success"])
+        self.assertEqual(result["RecycledCount"], 0)
+        self.assertEqual(result["RecycleFailedCount"], 1)
+        self.assertEqual(result["TotalFiles"], 2)
+        self.assertTrue(kept.exists() and copy.exists())
+        self.assertIn("回收失败 1 个", Path(result["ReportPath"]).read_text(encoding="utf-8-sig"))
+
+    def test_plain_move_never_deduplicates_and_cross_category_files_are_preserved(self):
+        put(self.root / "first.docx", b"same")
+        put(self.root / "second.docx", b"same")
+        plain = run(self.root, apply=True)
+        self.assertEqual(plain["RecycledCount"], 0)
+        self.assertEqual(plain["TotalFiles"], 2)
+        (self.output / "word" / "second.docx").unlink()
+        put(self.output / "PDF" / "same.pdf", b"same")
+        put(self.output / "custom" / "a.docx", b"same")
+        put(self.output / "custom" / "b.docx", b"same")
+        result = run(self.root, apply=True, deduplicate=True)
+        self.assertTrue(result["Success"], result["Failures"])
+        self.assertEqual(result["DuplicateCount"], 0)
+        self.assertEqual(result["TotalFiles"], 4)
+
+    def test_unreadable_duplicate_and_changed_files_are_retained(self):
+        kept = put(self.output / "word" / "keep.docx", b"same")
+        duplicate = put(self.output / "word" / "copy.docx", b"same")
+        with ExclusiveFile(duplicate):
+            preview = run(self.root, deduplicate=True)
+        self.assertFalse(preview["Success"])
+        self.assertFalse(preview["DuplicateCheckComplete"])
+        self.assertEqual(preview["RecycledCount"], 0)
+        result = self.helper(r'''
+$entries=@((New-DuplicateEntry (Get-Item -LiteralPath $cfg.Keeper) 'word' $true), (New-DuplicateEntry (Get-Item -LiteralPath $cfg.Candidate) 'word' $true))
+$pairs=@(Get-DuplicatePlan $entries)
+[IO.File]::WriteAllText($pairs[0].Candidate.Path,'changed')
+$script:called=$false
+$failed=$false
+try { $null=Invoke-DuplicateRecycle $pairs[0] -RecycleAction {param($p) $script:called=$true; [pscustomobject]@{Recycled=$true}} } catch {$failed=$true}
+[pscustomobject]@{Failed=$failed;Called=$script:called;KeptExists=(Test-Path -LiteralPath $pairs[0].Keeper.Path);CandidateExists=(Test-Path -LiteralPath $pairs[0].Candidate.Path)} | ConvertTo-Json
+''', Keeper=str(kept), Candidate=str(duplicate))
+        self.assertTrue(result["Failed"])
+        self.assertFalse(result["Called"])
+        self.assertTrue(result["KeptExists"] and result["CandidateExists"])
+
+    def test_recycle_refusal_cancellation_and_unavailable_backend_retain_files(self):
+        kept = put(self.output / "word" / "keep.docx", b"same")
+        duplicate = put(self.output / "word" / "copy.docx", b"same")
+        result = self.helper(r'''
+$pairs=@(Get-DuplicatePlan @((New-DuplicateEntry (Get-Item -LiteralPath $cfg.Keeper) 'word' $true), (New-DuplicateEntry (Get-Item -LiteralPath $cfg.Candidate) 'word' $true)))
+$failures=0
+foreach($action in @({param($p) throw 'interface unavailable'}, {param($p) [pscustomobject]@{Recycled=$false;Error='cancelled'}}, {param($p) [pscustomobject]@{Recycled=$false;Error='cannot recycle'}})) {
+    try {$null=Invoke-DuplicateRecycle $pairs[0] -RecycleAction $action} catch {$failures++}
+}
+Add-Type -Path (Join-Path (Split-Path -Parent $cfg.Script) 'recycle-native.cs')
+$sink=[WechatOrganizerRecycleV1.NativeRecycle+Sink]::new($cfg.Candidate,$pairs[0].Candidate.Hash,4,0,0)
+$veto=$sink.PreDeleteItem(0,$null)
+$sink.Dispose()
+[pscustomobject]@{Failures=$failures;Veto=$veto;KeptExists=(Test-Path -LiteralPath $cfg.Keeper);CandidateExists=(Test-Path -LiteralPath $cfg.Candidate)} | ConvertTo-Json
+''', Keeper=str(kept), Candidate=str(duplicate))
+        self.assertEqual(result["Failures"], 3)
+        self.assertLess(result["Veto"], 0)
+        self.assertTrue(result["KeptExists"] and result["CandidateExists"])
+
     def test_empty_run_and_rounded_fractional_kb(self):
         empty = run(self.root, apply=True)
         self.assertTrue(empty["Success"])
-        self.assertEqual(len(empty["Statistics"]), len(CATEGORIES))
+        self.assertEqual(empty["Statistics"], [])
         self.assertTrue(all(r["FileCount"] == 0 and r["SizeKB"] == "0.00" for r in empty["Statistics"]))
         put(self.root / "fraction.pdf", b"1234567890")
         result = run(self.root, apply=True)
@@ -509,7 +714,7 @@ class OrganizerTests(unittest.TestCase):
         contents = {path.read_bytes() for path in (self.output / "PDF").iterdir()}
         self.assertEqual(contents, {b"existing", b"first", b"second"})
         self.assertEqual((self.output / "PDF" / "报告.pdf").read_bytes(), b"existing")
-        self.assertEqual(list((self.output / "其他").iterdir()), [])
+        self.assertFalse((self.output / "其他").exists())
         stats = next(row for row in result["Statistics"] if row["Folder"] == "PDF")
         self.assertEqual(stats["FileCount"], 3)
         self.assertRegex(Path(result["ReportPath"]).read_text(encoding="utf-8-sig"), r"PDF\s+\|\s+3 个\s+\|")
@@ -540,6 +745,9 @@ class OrganizerTests(unittest.TestCase):
         report = Path(result["ReportPath"]).read_text(encoding="utf-8-sig")
         for category, display in expected.items():
             with self.subTest(category=category):
+                if sizes[category] == 0:
+                    self.assertNotIn(category, stats)
+                    continue
                 self.assertEqual(stats[category]["Size"], display)
                 self.assertEqual(stats[category]["SizeKB"], f"{sizes[category] / 1024:.2f}")
                 self.assertRegex(report, rf"(?m)^{re.escape(category)}\s+\|\s+\d+ 个\s+\|\s+{re.escape(display)}$")
@@ -579,7 +787,7 @@ class OrganizerTests(unittest.TestCase):
             return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
 
         rows = [line for line in report.splitlines() if " | " in line]
-        self.assertEqual(len(rows), 1 + len(CATEGORIES) + len(names) + 1)
+        self.assertEqual(len(rows), 1 + 2 + len(names) + 1)
         baseline = [width(cell) for cell in rows[0].split(" | ")]
         for row in rows:
             cells = row.split(" | ")
@@ -654,7 +862,8 @@ class OrganizerTests(unittest.TestCase):
                 self.assertNotIn("额外链接", [r["Folder"] for r in stats["Statistics"]])
             finally:
                 target_link.unlink()
-            (self.output / "word").rmdir()
+            if (self.output / "word").exists():
+                (self.output / "word").rmdir()
             self.make_symlink(outside, self.output / "word", target_is_directory=True)
             try:
                 rejected = run(self.root, apply=True, check=False)

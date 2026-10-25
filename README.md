@@ -1,12 +1,15 @@
 # wechat_download_files_organizer
 
-一个非常小的skill,  用于整理 Windows 的微信APP下载的文件。
+一个非常小的skill,  整理 Windows 的微信APP下载的文件。
 
-1. 在当前 Windows 用户目录和 Windows 文档目录下查找 `xwechat_files\<账号文件夹>\msg\file`，汇总找到的账号；也可直接指定文件目录
+1. 在当前 Windows 用户目录或 Windows 文档目录下查找 `xwechat_files\<账号文件夹>\msg\file`，汇总找到的账号；也可直接指定文件目录
 2. 如果电脑里登陆过多个微信, Agent会先询问要操作哪个微信号
-3. Agent会先询问用户, 是进行预览, 还是进行移动操作. 预览显示各分类的文件数量、大小和总计，大小自动选择 KB、MB 或 GB。
-4. 如果用户确定移动, 则把微信下载的文件, 移动到\msg\file\整理归纳,  其中 "整理归纳"文件夹是本skill新增的, 里面包含 `word`、`excel`、`ppt`、`压缩包`、`DWG`、`PDF`、`其他`这7个文件夹. 同名文件会自动编号(后面新增数字).
-5.  生成包含文件数量与大小的.txt 统计报告。
+3. Agent会先询问用户:
+   1. 仅预览.  预览显示各分类的文件数量、大小和总计。
+   2. 移动. 
+   3. 移动,  且分类归档后删除重复的文件
+4. 如果用户确定移动, 则把微信下载的文件, 移动到\msg\file\整理归纳, 其中 "整理归纳"文件夹是本skill新增的, 里面包含 `word`、`excel`、`ppt`、`压缩包`、`DWG`、`PDF`、`音频`、`其他`这7个文件夹. 同名文件会自动编号(后面新增数字).
+5. 生成包含文件数量与大小的.txt 统计报告。
 
 > 注意, 当执行本skill后, 由于文件移动了位置, 则在微信聊天窗口中点击别人发的文件时, 不像往常一样直接打开文件. 而是提示未下载, 需要重新下载.
 
@@ -14,19 +17,18 @@
 
 ```mermaid
 flowchart TD
-    A["用户调用 skill"] --> D["自动查找 xwechat_files<br/>或用户指定路径"]
-    D --> B["手动选择微信账号"]
-    B -->|已确认| C{"询问用户：预览 or 正式移动？"}
-    C -->|只读预览| P["只读扫描并计算分类<br/>不移动文件"]
-    P --> Q["显示各分类的文件数量、大小"]
-    Q --> Z
-    Q -.->|用户明确要求移动| M
-    C -->|正式移动| M["按扩展名移动到7类文件夹<br/>同名自动编号"]
-    M --> S["统计移动后的文件数量、大小<br/>生成统计信息.txt"]
-    S --> Z["结束"]
+    A[用户点名调用 skill] --> B[发现账号并通过选择卡片确认]
+    B --> C{选择本次操作}
+    C -->|仅预览| P[预览显示各分类的文件数量、大小和总计]
+    C -->|正式移动| M[移动到\msg\file\整理归纳]
+    C -->|正式移动且删除重复文件| D[移动到\msg\file\整理归纳]
+    D --> R[删除重复文件，移入回收站]
+    R --> S[如果分类后某种类型的文件夹为空<br>则不创建该文件夹]
+    M --> S
+    S --> T[更新统计信息<br> 写入'整理统计.txt']
 ```
 
-选择预览后不会自动转为移动；图中的虚线仅表示用户后续明确要求移动时的流程。操作选择由 agent 询问，脚本本身不弹出确认。
+只有一个账号也要确认。优先用可点击的选项卡；不支持时才显示编号选项。
 
 ## 安装到 Codex 或 Claude Code
 
@@ -53,20 +55,21 @@ flowchart TD
     ├── agents\
     │   └── openai.yaml
     ├── scripts\
-    │   └── organize.ps1
+    │   ├── organize.ps1
+    │   ├── deduplicate.ps1
+    │   └── recycle-native.cs
     └── tests\
-        └── test_organizer.py
+        ├── test_organizer.py
+        └── restore-test-recycle.ps1
 ```
 
 如果工具没有显示新安装或更新的 skill，请重新启动对应工具或新建会话。
 
-## 在 Claude Code 中使用(尚未测试)
-
-输入 `/wechat_download_files_organizer`，或附上“预览微信文件，先不要移动文件”。未指定目录时，会先列出候选账号并等待选择；目录确定后，再询问本次进行只读预览还是正式移动。
+## 在 Claude Code 中使用(已测试)
 
 如果提示需要权限, 则回复同意Claude Code的需求.
 
-## 在 Codex 中使用(成功测试)
+## 在 Codex 中使用(已测试)
 
 此 skill 当前配置为显式调用，请在对话框中按$符号, 主动调用 `$wechat_download_files_organizer`。
 
@@ -88,9 +91,19 @@ flowchart TD
 
 账号或目录确定后，agent 会再次询问：
 
-> 本次要进行“只读预览”（不移动、不写报告），还是“正式移动”（分类移动并更新统计报告）？
+| 选项 | 行为 |
+|---|---|
+| 仅预览 | 分类及重复副本分析，不移动、不写报告 |
+| 正式移动 | 分类移动，重复副本全部保留 |
+| 正式移动且删除重复文件 | 包含历史重复文件；每组保留一份，其余放入回收站 |
+
+优先使用 Codex/Claude Code 可用的结构化提问工具，点选并提交即可；工具不可用时回退为编号选项。选择第三项后无需重复确认相同授权。
 
 即使最初说了“整理”，或直接给出完整路径，也会等待这次操作选择。选择预览后只汇报预览结果，不自动接着移动；之后明确要求移动同一目录时才执行。尚未回答或取消时，不运行预览或移动。安装或修改 skill 本身不会触发整理。
+
+----
+
+## *======以下内容可以不看======*
 
 ## 直接运行脚本
 
@@ -120,22 +133,17 @@ powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -ListAc
 ### 2. 只读预览
 
 ```powershell
-powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -AsJson
+powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -Deduplicate -AsJson
 ```
 
-预览不会移动文件，也不会创建分类目录或统计报告。结果显示七个分类的文件数量、文件大小及总计；大小仅包含本次待整理文件，不含 `整理归纳` 中已有文件。
+预览不会移动文件，也不会创建分类目录或统计报告。结果只显示有文件的分类及总计；包括本次新文件和从“其他”迁移的音频，不含其余已有文件。另显示历史及本次文件中的预计重复副本数量与大小，不从移动预览中扣除。
 
-各分类和总计分别按真实字节数自动选择 KB、MB 或 GB，按 1024 换算并保留两位小数；空分类显示 `0.00 KB`。总计先累加原始字节数再换算。以下为预览示例：
+各分类和总计分别按真实字节数自动选择 KB、MB 或 GB，按 1024 换算并保留两位小数；空分类不显示；零字节文件计入文件数量并显示 `0.00 KB`。总计先累加原始字节数再换算。以下为预览示例：
 
 | 分类 | 文件数量 | 文件大小 |
 | --- | ---: | ---: |
 | word | 2 | 768.00 KB |
 | excel | 1 | 768.00 KB |
-| ppt | 0 | 0.00 KB |
-| 压缩包 | 0 | 0.00 KB |
-| DWG | 0 | 0.00 KB |
-| PDF | 0 | 0.00 KB |
-| 其他 | 0 | 0.00 KB |
 | 总计 | 3 | 1.50 MB |
 
 JSON 的 `Statistics` 返回各分类的 `Folder`、`FileCount`、`Size` 和兼容字段 `SizeKB`，`TotalFiles`、`TotalSize` 返回总计。读取失败时 `StatisticsComplete=false`，必须说明预览统计不完整。
@@ -148,14 +156,22 @@ powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPa
 
 `-AsJson` 可省略，省略后输出可读文本。`-ListAccounts` 不能与 `-RootPath` 或 `-Apply` 同时使用；`-WechatBasePath` 仅用于列出账号。预览和正式整理都必须明确提供 `-RootPath`。
 
-### 4. 按需查看逐文件明细
+### 4. 正式移动且回收重复副本
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -Apply -Deduplicate -AsJson
+```
+
+不带 `-Apply` / `-Deduplicate` 是快速分类预览；单独 `-Deduplicate` 是分类及去重预览。`-ListAccounts` 不能与 `-Deduplicate` 同用。
+
+### 5. 按需查看逐文件明细
 
 默认 JSON 返回分类数量、重命名数、失败详情、跳过链接、统计及报告位置，不包含 `Records`。默认文本也只输出汇总、失败和跳过链接情况。
 
 预览完整明细：
 
 ```powershell
-powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -AsJson -IncludeRecords
+powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<选定的 msg\file 完整路径>" -Deduplicate -AsJson -IncludeRecords
 ```
 
 正式整理并返回完整明细：
@@ -178,11 +194,12 @@ powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPa
 | `压缩包` | `.zip` `.rar` `.7z` `.tar` `.gz` `.tgz` `.bz2` `.xz` `.zst` `.cab` |
 | `DWG` | `.dwg` |
 | `PDF` | `.pdf`（忽略扩展名大小写） |
+| `音频` | .mp3 .wav .flac .m4a .m4b .aac .ogg .opus .wma .amr .aif .aiff .ape .alac .mid .midi .silk |
 | `其他` | 其余文件，包括图片、YML 和无扩展名文件 |
 
 ## 整理结果与统计报告
 
-文件移动到本次选定源目录下的 `整理归纳`：
+文件移动到本次选定源目录下的 `整理归纳`，以下为全部可用分类，实际只创建需要的目录：
 
 ```text
 msg/file/
@@ -193,15 +210,18 @@ msg/file/
     ├── 压缩包/
     ├── DWG/
     ├── PDF/
+    ├── 音频/
     ├── 其他/
     └── 整理统计.txt
 ```
 
-每次正式运行都会覆盖更新 UTF-8 编码的 `整理统计.txt`，即使本次没有文件需要移动。再次整理时会跳过整个 `整理归纳` 目录，避免重复移动已归类文件。
+每次正式运行都会覆盖更新 UTF-8 编码的 `整理统计.txt`，即使本次没有文件需要移动。分类扫描跳过 `整理归纳`，但两种正式模式会把“其他”中的已有音频迁入“音频”；第三种模式还会检查内置分类中的历史重复文件。
 
-统计范围为 `整理归纳` 下所有直接子文件夹中的递归文件，包含已有文件及用户新增目录；空目录显示零，链接跳过。各文件夹和总计分别自动选择大小单位：小于 1 MB 显示 KB，达到 1 MB 且小于 1 GB 显示 MB，达到 1 GB 显示 GB。按 **1 KB = 1024 字节、1 MB = 1024 KB、1 GB = 1024 MB** 换算，保留两位小数，使用文件逻辑大小；空目录显示 `0.00 KB`。总计基于原始字节数独立计算和换算。`整理归纳` 根目录中的文件不计入总计。
+通过 agent 执行正式流程后，会读取本次生成的 `整理统计.txt`，在最终回复中以文本代码块原样展示报告全文，并提供文件链接。部分操作失败但报告已生成时也会展示，保留报告内的提示；仅预览时展示预览结果。报告未生成或读取失败时会说明原因，不展示历史报告。
 
-JSON 的 `Statistics[].Size` 为带单位的大小（如 `1.50 GB`），同时保留原有 `SizeKB` 字段；`TotalFiles`、`TotalSize` 返回总计。正式整理的这些字段统计目标目录中的实际文件，包含已有文件；预览时则仅统计本次待整理文件。
+统计范围为 `整理归纳` 下所有直接子文件夹中的递归文件，包含已有文件及用户新增目录；无文件的目录不显示，链接跳过。各文件夹和总计分别自动选择大小单位：小于 1 MB 显示 KB，达到 1 MB 且小于 1 GB 显示 MB，达到 1 GB 显示 GB。按 **1 KB = 1024 字节、1 MB = 1024 KB、1 GB = 1024 MB** 换算，保留两位小数，使用文件逻辑大小；零字节文件所在分类显示 `0.00 KB`。总计基于原始字节数独立计算和换算。`整理归纳` 根目录中的文件不计入总计。
+
+JSON 的 `Statistics[].Size` 为带单位的大小（如 `1.50 GB`），同时保留原有 `SizeKB` 字段；`TotalFiles`、`TotalSize` 返回总计。正式整理的这些字段统计目标目录中的实际文件，包含已有文件；预览时则统计本次新文件和待迁移的已有音频。
 
 报告保留三列表格，根据中英文显示宽度及实际内容自动调整列宽。文件夹名称左对齐，数量和大小右对齐，用 ` | ` 分隔，分隔线与表格同宽。
 
@@ -222,9 +242,10 @@ ppt               |     5 个 |   45.00 MB
 压缩包            |     4 个 |  120.00 MB
 DWG               |     7 个 |   32.00 MB
 PDF               |    10 个 |   20.00 MB
+音频              |     3 个 |    9.00 MB
 其他              |     5 个 |    4.00 MB
 ------------------+----------+-----------
-总计              |    51 个 |  245.00 MB
+总计              |    54 个 |  254.00 MB
 
 说明：
 统计包含子文件夹中的文件。
@@ -233,9 +254,26 @@ PDF               |    10 个 |   20.00 MB
 =========================================
 ```
 
+选择“正式移动且删除重复文件”后，报告还会包含本次处理摘要，例如：
+
+```text
+本次去重：2 个重复副本移入回收站，大小 6.00 MB；回收失败 0 个。
+```
+
 本次运行不生成移动记录 CSV，也不删除已有历史 CSV；普通 CSV 文件仍归入 `excel` 并计入统计。
 
 若目录读取失败，报告会标注统计不完整。请检查运行结果中的失败信息；JSON 结果的 `Success=false` 表示存在失败，报告写入失败也会在结果中反映。
+
+## 空目录与去重规则
+
+- 按需创建分类。正式处理后，只非递归移除物理为空的内置分类目录；存在任何子项时保留，不删除自建目录或月份目录。所有统计行按文件数量过滤，零字节文件不是空分类。
+- 两种正式模式都迁移“其他”中的已有音频。普通移动保留所有副本；只有 `-Apply -Deduplicate` 才回收副本。
+- 去重只在八个内置分类各自内部递归比较，不跨分类、不处理自建的其他分类和根目录文件。先比较大小，再计算 SHA-256，名称不作为重复依据。
+- 每组优先保留原有文件（含迁移的已有音频），其次保留创建时间最早者，再按完整路径排序。
+- 回收前重新校验，保留文件在回收期间被只读锁定。读取失败、占用或变化时保留相关文件并返回失败详情。
+- 使用原生 Windows `IFileOperation` 及删除前回调拒绝不可回收的删除。接口不可用、路径不支持回收、失败或取消时保留文件，不永久删除回退、不清空回收站。
+- `DuplicateCount` / `DuplicateSize` 表示发现的重复副本；`RecycledCount` / `RecycledSize` 表示实际成功回收，`RecycleFailedCount` 表示回收失败。`DuplicateCheckComplete` 在未请求去重时为 null，无法完整校验时为 false。移入回收站不等于释放磁盘空间。
+- `CategoryCounts` 保留八类键；`Statistics` 只返回非空分类。`-IncludeRecords` 增加副本计划及处理明细，`KeptPath` 指出保留文件，不另写日志。
 
 ## 使用前须知
 
@@ -264,7 +302,7 @@ powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion'
 
 Windows 11 自带的是 Windows PowerShell 5.1（`powershell.exe`），PowerShell 7（`pwsh.exe`）需另外安装，二者可并存，见 [Microsoft 官方说明](https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows)。本包兼容两者，不依赖某个 AI 工具附带的私有运行时。
 
-保留 `scripts/organize.ps1` 的 UTF-8 BOM；不要另存为无 BOM 的 UTF-8 或 ANSI。脚本的控制台输出和统计报告均显式使用 UTF-8。默认调用不修改或覆盖 PowerShell 执行策略。运行时兼容与脚本执行权限是独立的前提。
+保留所有 `.ps1` 的 UTF-8 BOM；不要另存为无 BOM 的 UTF-8 或 ANSI。脚本的控制台输出和统计报告均显式使用 UTF-8。默认调用不修改或覆盖 PowerShell 执行策略。运行时兼容与脚本执行权限是独立的前提。
 
 ## 项目文件
 
@@ -273,7 +311,10 @@ Windows 11 自带的是 Windows PowerShell 5.1（`powershell.exe`），PowerShel
 | [SKILL.md](SKILL.md) | Codex 的调用流程、分类规则和输出要求 |
 | [agents/openai.yaml](agents/openai.yaml) | 显示信息和显式调用配置 |
 | [scripts/organize.ps1](scripts/organize.ps1) | 账号发现、只读预览、文件移动与统计实现 |
+| [scripts/deduplicate.ps1](scripts/deduplicate.ps1) | 重复内容分析与校验 |
+| [scripts/recycle-native.cs](scripts/recycle-native.cs) | Windows 回收站及删除前保护 |
 | [tests/test_organizer.py](tests/test_organizer.py) | 基于临时文件的集成测试 |
+| [tests/restore-test-recycle.ps1](tests/restore-test-recycle.ps1) | 仅恢复本次测试专属路径下的回收文件 |
 
 ## 运行测试
 
@@ -285,7 +326,7 @@ python ./tests/test_organizer.py
 
 要验证 PowerShell 7，在 PowerShell 中先设 `$env:WECHAT_TEST_POWERSHELL = "pwsh"` 再运行相同测试；也可指定可执行文件的完整路径。测试脚本按 UTF-8 读取输出。
 
-测试使用独立临时目录，不操作真实微信下载目录。临时目录创建在仓库的父目录下，因此该位置需要写入权限；涉及文件符号链接的测试在缺少相应 Windows 权限时会跳过。
+测试使用独立临时目录，不操作真实微信下载目录。临时目录创建在仓库的父目录下，因此该位置需要写入权限；涉及文件符号链接的测试在缺少相应 Windows 权限时会跳过。回收站测试只回收刚创建的测试副本，并按测试专属路径恢复，不处理原有回收站内容。
 
 ## 执行策略与自动模式权限
 

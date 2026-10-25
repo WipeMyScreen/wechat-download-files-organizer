@@ -5,6 +5,7 @@ param(
     [switch]$ListAccounts,
     [string]$WechatBasePath,
     [switch]$Apply,
+    [switch]$Deduplicate,
     [switch]$AsJson,
     [switch]$IncludeRecords
 )
@@ -18,7 +19,7 @@ $culture = [Globalization.CultureInfo]::InvariantCulture
 $issues = [Collections.Generic.List[object]]::new()
 $skippedLinks = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $records = [Collections.Generic.List[object]]::new()
-$categories = @('word', 'excel', 'ppt', '压缩包', 'DWG', 'PDF', '其他')
+$categories = @('word', 'excel', 'ppt', '压缩包', 'DWG', 'PDF', '音频', '其他')
 $extensionGroups = [ordered]@{
     word = '.doc .docx .docm .dot .dotx .dotm .wps .wpt'
     excel = '.xls .xlsx .xlsm .xlsb .xlt .xltx .xltm .csv .et .ett'
@@ -26,6 +27,7 @@ $extensionGroups = [ordered]@{
     '压缩包' = '.zip .rar .7z .tar .gz .tgz .bz2 .xz .zst .cab'
     DWG = '.dwg'
     PDF = '.pdf'
+    '音频' = '.mp3 .wav .flac .m4a .m4b .aac .ogg .opus .wma .amr .aif .aiff .ape .alac .mid .midi .silk'
 }
 $extensionMap = @{}
 foreach ($group in $extensionGroups.Keys) {
@@ -161,8 +163,8 @@ function Format-ReportTable([object[]]$Rows, [long]$TotalFiles, [string]$TotalSi
 }
 
 if ($ListAccounts) {
-    if ($Apply -or -not [string]::IsNullOrWhiteSpace($RootPath)) {
-        throw '列出账号不能与 -Apply 或 -RootPath 同时使用。请先选择账号，再执行整理。'
+    if ($Apply -or $Deduplicate -or -not [string]::IsNullOrWhiteSpace($RootPath)) {
+        throw '列出账号不能与 -Apply、-Deduplicate 或 -RootPath 同时使用。请先选择账号，再执行整理。'
     }
     if ([string]::IsNullOrWhiteSpace($WechatBasePath)) {
         $userProfileDirectory = [Environment]::GetFolderPath('UserProfile')
@@ -235,6 +237,7 @@ if ([string]::IsNullOrWhiteSpace($RootPath)) {
     throw '未选择微信账号目录。请先用 -ListAccounts 列出账号并询问用户，再通过 -RootPath 指定完整的 msg\file 路径。'
 }
 
+if ($Deduplicate) { . (Join-Path $PSScriptRoot 'deduplicate.ps1') }
 $root = Get-NormalizedDirectoryPath $RootPath
 Assert-PlainDirectory $root -CheckParents
 $output = Join-Path $root '整理归纳'
@@ -262,36 +265,40 @@ $reportWritten = $false
 try {
     try { $acquired = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $acquired = $true }
     if (-not $acquired) { throw '此目录已有整理任务运行，请稍后重试。' }
-    $files = @(Get-RegularFiles -Path $root -ExcludedDirectory $output | Sort-Object FullName)
+
+    $incoming = @(Get-RegularFiles -Path $root -ExcludedDirectory $output | Sort-Object FullName)
+    $audioMigrations = @()
+    $otherDirectory = Join-Path $output '其他'
+    if (Test-Path -LiteralPath $otherDirectory) {
+        $audioMigrations = @(Get-RegularFiles -Path $otherDirectory | Where-Object { $extensionMap[$_.Extension.ToLowerInvariant()] -eq '音频' } | Sort-Object FullName)
+    }
+    $files = @($audioMigrations) + @($incoming)
+    $migrationPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in $audioMigrations) { [void]$migrationPaths.Add($file.FullName) }
+    $newPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $reserved = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $previewBytes = @{}
     foreach ($category in $categories) { $previewBytes[$category] = [long]0 }
-    if ($Apply) {
-        foreach ($directory in @($output) + @($categories | ForEach-Object { Join-Path $output $_ })) {
-            [void][IO.Directory]::CreateDirectory($directory)
-            Assert-PlainDirectory $directory
-        }
-    }
-
     foreach ($file in $files) {
         $category = $extensionMap[$file.Extension.ToLowerInvariant()]
         if (-not $category) { $category = '其他' }
         $destination = ''
         $record = [pscustomobject]@{
             Time = Get-BeijingTime; Source = $file.FullName; Destination = ''
-            Category = $category; Status = 'Planned'; Renamed = $false; Error = ''
+            Category = $category; Status = 'Planned'; Renamed = $false; Error = ''; KeptPath = $null
         }
         try {
             $targetDirectory = Join-Path $output $category
             $destination = Get-FreeDestination $targetDirectory $file.Name
             if ($Apply) {
+                Assert-PlainDirectory $file.DirectoryName -CheckParents
                 $current = Get-Item -LiteralPath $file.FullName -Force
-                if ($current.PSIsContainer -or ($current.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-                    throw '源文件已变成文件夹或链接，已跳过。'
-                }
-                # The two-argument overload never overwrites an existing file.
+                if ($current.PSIsContainer -or ($current.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw '源文件已变成文件夹或链接，已跳过。' }
+                [void][IO.Directory]::CreateDirectory($targetDirectory)
+                Assert-PlainDirectory $targetDirectory -CheckParents
                 [IO.File]::Move($file.FullName, $destination)
                 $record.Status = 'Moved'
+                if (-not $migrationPaths.Contains($file.FullName)) { [void]$newPaths.Add($destination) }
             }
             [void]$reserved.Add($destination)
             if (-not $Apply) { $previewBytes[$category] += $file.Length }
@@ -304,42 +311,97 @@ try {
         $record.Renamed = [bool]($destination -and ([IO.Path]::GetFileName($destination) -cne $file.Name))
         $records.Add($record)
     }
-
     $categoryCounts = [ordered]@{}
     foreach ($category in $categories) {
         $categoryCounts[$category] = @($records | Where-Object { $_.Category -eq $category -and $_.Status -ne 'Failed' }).Count
     }
+
+    $duplicatePairs = @()
+    [long]$duplicateBytes = 0
+    [long]$recycledBytes = 0
+    $recycledCount = 0
+    $duplicateCheckComplete = $null
+    if ($Deduplicate) {
+        $entries = [Collections.Generic.List[object]]::new()
+        foreach ($category in $categories) {
+            $directory = Join-Path $output $category
+            if (-not (Test-Path -LiteralPath $directory)) { continue }
+            foreach ($file in @(Get-RegularFiles -Path $directory -Stage 'Duplicate')) {
+                $group = $category
+                if (-not $Apply -and $migrationPaths.Contains($file.FullName)) { $group = '音频' }
+                $entries.Add((New-DuplicateEntry $file $group (-not $newPaths.Contains($file.FullName))))
+            }
+        }
+        if (-not $Apply) {
+            foreach ($file in $incoming) {
+                $category = $extensionMap[$file.Extension.ToLowerInvariant()]
+                if (-not $category) { $category = '其他' }
+                $entries.Add((New-DuplicateEntry $file $category $false))
+            }
+        }
+        $duplicatePairs = @(Get-DuplicatePlan -Entries $entries.ToArray())
+        $duplicateCheckComplete = @($issues | Where-Object { $_.Stage -in @('Scan', 'Duplicate', 'Move') }).Count -eq 0
+        foreach ($pair in $duplicatePairs) {
+            $duplicateBytes += $pair.Candidate.Length
+            $detail = [pscustomobject]@{
+                Time = Get-BeijingTime; Source = $pair.Candidate.Path; Destination = $null
+                Category = $pair.Candidate.Category; Status = 'DuplicatePlanned'
+                Renamed = $false; Error = ''; KeptPath = $pair.Keeper.Path
+            }
+            if ($Apply) {
+                try {
+                    $null = Invoke-DuplicateRecycle $pair
+                    $recycledCount++
+                    $recycledBytes += $pair.Candidate.Length
+                    $detail.Status = 'Recycled'
+                } catch {
+                    $detail.Status = 'RecycleFailed'
+                    $detail.Error = $_.Exception.Message
+                    Add-Issue 'Recycle' $pair.Candidate.Path $detail.Error
+                }
+            }
+            $records.Add($detail)
+        }
+    }
     if ($Apply) {
+        # Non-recursive: a subdirectory, hidden file or a concurrent arrival prevents removal.
+        foreach ($category in $categories) {
+            $directory = Join-Path $output $category
+            if (-not (Test-Path -LiteralPath $directory)) { continue }
+            try {
+                Assert-PlainDirectory $directory -CheckParents
+                if (@(Get-ChildItem -LiteralPath $directory -Force).Count -eq 0) { [IO.Directory]::Delete($directory, $false) }
+            } catch { Add-Issue 'EmptyDirectory' $directory $_.Exception.Message }
+        }
         $issueCountBeforeStats = $issues.Count
         try {
-            $folders = @(Get-ChildItem -LiteralPath $output -Directory -Force)
-            $orderedNames = @($categories) + @($folders.Name | Where-Object { $_ -notin $categories } | Sort-Object)
-            foreach ($name in $orderedNames) {
-                $folder = Get-Item -LiteralPath (Join-Path $output $name) -Force
-                if ($folder.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                    [void]$skippedLinks.Add($folder.FullName)
-                    continue
+            if (Test-Path -LiteralPath $output) {
+                $folders = @(Get-ChildItem -LiteralPath $output -Directory -Force)
+                $orderedNames = @($categories | Where-Object { Test-Path -LiteralPath (Join-Path $output $_) }) + @($folders | Where-Object { $_.Name -notin $categories } | Sort-Object Name | Select-Object -ExpandProperty Name)
+                foreach ($name in $orderedNames) {
+                    $folder = Get-Item -LiteralPath (Join-Path $output $name) -Force
+                    if ($folder.Attributes -band [IO.FileAttributes]::ReparsePoint) { [void]$skippedLinks.Add($folder.FullName); continue }
+                    $folderFiles = @(Get-RegularFiles -Path $folder.FullName -Stage 'Statistics')
+                    if ($folderFiles.Count -eq 0) { continue }
+                    [long]$bytes = 0
+                    foreach ($item in $folderFiles) { $bytes += $item.Length }
+                    $statistics.Add([pscustomobject]@{ Folder = $name; FileCount = $folderFiles.Count; SizeKB = ($bytes / 1024.0).ToString('F2', $culture); Size = (Format-FileSize $bytes); Bytes = $bytes })
                 }
-                $folderFiles = @(Get-RegularFiles -Path $folder.FullName -Stage 'Statistics')
-                [long]$bytes = 0
-                foreach ($item in $folderFiles) { $bytes += $item.Length }
-                $statistics.Add([pscustomobject]@{ Folder = $name; FileCount = $folderFiles.Count; SizeKB = ($bytes / 1024.0).ToString('F2', $culture); Size = (Format-FileSize $bytes); Bytes = $bytes })
             }
         } catch { Add-Issue 'Statistics' $output $_.Exception.Message }
         $statisticsComplete = $issues.Count -eq $issueCountBeforeStats
     } else {
         foreach ($category in $categories) {
+            if ($categoryCounts[$category] -eq 0) { continue }
             [long]$bytes = $previewBytes[$category]
             $statistics.Add([pscustomobject]@{ Folder = $category; FileCount = $categoryCounts[$category]; SizeKB = ($bytes / 1024.0).ToString('F2', $culture); Size = (Format-FileSize $bytes); Bytes = $bytes })
         }
-        $statisticsComplete = $issues.Count -eq 0
+        $statisticsComplete = @($issues | Where-Object { $_.Stage -in @('Scan', 'Move') }).Count -eq 0
     }
     [long]$totalFiles = 0
     [long]$totalBytes = 0
-    foreach ($row in $statistics) {
-        $totalFiles += $row.FileCount
-        $totalBytes += $row.Bytes
-    }
+    foreach ($row in $statistics) { $totalFiles += $row.FileCount; $totalBytes += $row.Bytes }
+    $recycleFailedCount = @($issues | Where-Object Stage -eq 'Recycle').Count
     if ($Apply) {
         $timestampLine = '统计时间：{0}（北京时间）' -f (Get-BeijingTime)
         $table = @(Format-ReportTable -Rows $statistics.ToArray() -TotalFiles $totalFiles -TotalSize (Format-FileSize $totalBytes) -MinimumWidth (Get-DisplayWidth $timestampLine))
@@ -352,6 +414,10 @@ try {
         $lines.Add('')
         $lines.AddRange([string[]]$table)
         $lines.Add('')
+        if ($Deduplicate) {
+            $lines.Add(('本次去重：{0} 个重复副本移入回收站，大小 {1}；回收失败 {2} 个。' -f $recycledCount, (Format-FileSize $recycledBytes), $recycleFailedCount))
+            if (-not $duplicateCheckComplete) { $lines.Add('注意：部分文件无法完成重复校验，相关文件已保留。') }
+        }
         $lines.Add('说明：')
         $lines.Add('统计包含子文件夹中的文件。')
         $lines.Add('本报告不计入统计。')
@@ -359,25 +425,22 @@ try {
         $lines.Add($outerDivider)
         $temporaryReport = Join-Path $output ('.统计_' + [Guid]::NewGuid().ToString('N') + '.tmp')
         try {
-            Assert-PlainDirectory $output
+            [void][IO.Directory]::CreateDirectory($output)
+            Assert-PlainDirectory $output -CheckParents
             [IO.File]::WriteAllLines($temporaryReport, $lines, [Text.UTF8Encoding]::new($true))
-            if (Test-Path -LiteralPath $reportPath) {
-                [IO.File]::Replace($temporaryReport, $reportPath, [System.Management.Automation.Language.NullString]::Value)
-            } else {
-                [IO.File]::Move($temporaryReport, $reportPath)
-            }
+            if (Test-Path -LiteralPath $reportPath) { [IO.File]::Replace($temporaryReport, $reportPath, [System.Management.Automation.Language.NullString]::Value) }
+            else { [IO.File]::Move($temporaryReport, $reportPath) }
             $reportWritten = $true
         } catch { Add-Issue 'Report' $reportPath $_.Exception.Message }
         finally { if (Test-Path -LiteralPath $temporaryReport) { Remove-Item -LiteralPath $temporaryReport -Force } }
     }
-
     $result = [pscustomobject]@{
         Mode = $(if ($Apply) { 'Apply' } else { 'Preview' })
         Success = ($issues.Count -eq 0)
         RootPath = $root; OutputPath = $output
         FileCount = $files.Count
         CategoryCounts = $categoryCounts
-        RenamedCount = @($records | Where-Object { $_.Renamed -and $_.Status -ne 'Failed' }).Count
+        RenamedCount = @($records | Where-Object { $_.Renamed -and $_.Status -in @('Moved', 'Planned') }).Count
         FailedCount = @($records | Where-Object Status -eq 'Failed').Count
         SkippedLinks = @($skippedLinks)
         Failures = $issues.ToArray()
@@ -386,20 +449,31 @@ try {
         TotalFiles = $totalFiles
         TotalSize = Format-FileSize $totalBytes
         ReportPath = $(if ($reportWritten) { $reportPath } else { $null })
+        Deduplicate = [bool]$Deduplicate
+        DuplicateCount = $duplicatePairs.Count
+        DuplicateSize = Format-FileSize $duplicateBytes
+        RecycledCount = $recycledCount
+        RecycledSize = Format-FileSize $recycledBytes
+        RecycleFailedCount = $recycleFailedCount
+        DuplicateCheckComplete = $duplicateCheckComplete
     }
     if ($IncludeRecords) { $result | Add-Member -NotePropertyName Records -NotePropertyValue $records.ToArray() }
     if ($AsJson) { $result | ConvertTo-Json -Depth 8 }
     else {
         if ($Apply) { '整理完成（请检查下列失败信息）。' } else { '只读预览：未移动文件，未写入目录或报告。' }
         if ($Apply) {
-            foreach ($category in $categories) { '{0}：{1} 个' -f $category, $categoryCounts[$category] }
+            foreach ($category in $categories) { if ($categoryCounts[$category]) { '{0}：{1} 个' -f $category, $categoryCounts[$category] } }
         } else {
-            '预计分类（仅本次待整理文件，不含整理归纳中已有文件）：'
+            '预计分类（本次新文件及待迁移音频，不含其余已归类文件）：'
             if (-not $statisticsComplete) { '注意：部分文件或目录处理失败，以下预览统计不完整。' }
             Format-ReportTable -Rows $statistics.ToArray() -TotalFiles $totalFiles -TotalSize $result.TotalSize
         }
         '重命名：{0} 个；移动失败：{1} 个；跳过链接：{2} 个' -f $result.RenamedCount, $result.FailedCount, $skippedLinks.Count
-        if ($IncludeRecords) { foreach ($record in $records) { '[{0}] {1} -> {2}' -f $record.Status, $record.Source, $record.Destination } }
+        if ($IncludeRecords) { foreach ($record in $records) { '[{0}] {1} -> {2}' -f $record.Status, $record.Source, $record.Destination; if ($record.KeptPath) { '保留：{0}' -f $record.KeptPath } } }
+        if ($Deduplicate) {
+            '发现重复副本：{0} 个，大小 {1}；已移入回收站：{2} 个，大小 {3}；回收失败：{4} 个。' -f $duplicatePairs.Count, $result.DuplicateSize, $recycledCount, $result.RecycledSize, $recycleFailedCount
+            if (-not $duplicateCheckComplete) { '注意：重复校验不完整，无法确认的文件已保留。' }
+        }
         foreach ($link in $skippedLinks) { '跳过链接：{0}' -f $link }
         foreach ($issue in $issues) { '[{0}] {1}：{2}' -f $issue.Stage, $issue.Path, $issue.Message }
         if ($reportWritten) { "统计报告：$reportPath" }
