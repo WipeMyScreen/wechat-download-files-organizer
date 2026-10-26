@@ -68,6 +68,7 @@ flowchart TD
 ## 在 Claude Code 中使用(已测试)
 
 如果提示需要权限, 则回复同意Claude Code的需求.
+<img width="897" height="317" alt="11a848e7eb3836903cf3215c1625ce2e" src="https://github.com/user-attachments/assets/86119f5a-9513-4c22-a403-8dd932a6da89" />
 
 ## 在 Codex 中使用(已测试)
 
