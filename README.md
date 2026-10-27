@@ -1,8 +1,10 @@
 # 微信下载文件整理
 
 将 Windows 微信下载文件按扩展名归入 `msg\file\整理归纳`，支持预览、普通移动、移动并回收重复副本。
+<img width="879" height="534" alt="image" src="https://github.com/user-attachments/assets/98a8697a-7e94-4bb8-be75-5929fe856478" />
 
 分类共 **8 类**：word、excel、ppt、压缩包、DWG、PDF、音频、其他。分类目录按需创建，同名文件自动编号，正式运行生成 `整理统计.txt`。
+
 
 ## 安装
 
