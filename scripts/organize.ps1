@@ -6,6 +6,7 @@ param(
     [string]$WechatBasePath,
     [switch]$Apply,
     [switch]$Deduplicate,
+    [switch]$MigrateLegacyAudio,
     [switch]$AsJson,
     [switch]$IncludeRecords
 )
@@ -163,8 +164,8 @@ function Format-ReportTable([object[]]$Rows, [long]$TotalFiles, [string]$TotalSi
 }
 
 if ($ListAccounts) {
-    if ($Apply -or $Deduplicate -or -not [string]::IsNullOrWhiteSpace($RootPath)) {
-        throw '列出账号不能与 -Apply、-Deduplicate 或 -RootPath 同时使用。请先选择账号，再执行整理。'
+    if ($Apply -or $Deduplicate -or $MigrateLegacyAudio -or -not [string]::IsNullOrWhiteSpace($RootPath)) {
+        throw '列出账号不能与 -Apply、-Deduplicate、-MigrateLegacyAudio 或 -RootPath 同时使用。'
     }
     if ([string]::IsNullOrWhiteSpace($WechatBasePath)) {
         $userProfileDirectory = [Environment]::GetFolderPath('UserProfile')
@@ -212,9 +213,8 @@ if ($ListAccounts) {
     $discovery = [pscustomobject]@{
         Mode = 'SelectAccount'
         Success = ($issues.Count -eq 0)
-        SelectionRequired = $true
+        SelectionRequired = ($candidates.Count -ne 1)
         SearchRoots = $searchRoots.ToArray()
-        SearchRoot = $(if ($searchRoots.Count -eq 1) { $searchRoots[0] } else { $null })
         CandidateCount = $candidates.Count
         Candidates = $candidates.ToArray()
         SkippedLinks = @($skippedLinks)
@@ -225,7 +225,7 @@ if ($ListAccounts) {
         '微信账号目录（搜索位置：{0}）' -f ($searchRoots -join '；')
         foreach ($candidate in $candidates) { '{0}：{1}' -f $candidate.AccountFolder, $candidate.RootPath }
         if ($candidates.Count -eq 0) { '未找到有效账号目录，请提供完整的 msg\file 路径，或指定其他 -WechatBasePath。' }
-        '请先由用户选择目录，再以 -RootPath 指定完整的 msg\file 路径；未移动或修改任何文件。'
+        '仅发现候选目录；唯一候选无需单独选账号，多候选须明确目录。执行时仍需 -RootPath；未移动或修改任何文件。'
         foreach ($issue in $issues) { '[{0}] {1}：{2}' -f $issue.Stage, $issue.Path, $issue.Message }
     }
     return
@@ -269,7 +269,7 @@ try {
     $incoming = @(Get-RegularFiles -Path $root -ExcludedDirectory $output | Sort-Object FullName)
     $audioMigrations = @()
     $otherDirectory = Join-Path $output '其他'
-    if (Test-Path -LiteralPath $otherDirectory) {
+    if ($MigrateLegacyAudio -and (Test-Path -LiteralPath $otherDirectory)) {
         $audioMigrations = @(Get-RegularFiles -Path $otherDirectory | Where-Object { $extensionMap[$_.Extension.ToLowerInvariant()] -eq '音频' } | Sort-Object FullName)
     }
     $files = @($audioMigrations) + @($incoming)
@@ -277,8 +277,8 @@ try {
     foreach ($file in $audioMigrations) { [void]$migrationPaths.Add($file.FullName) }
     $newPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $reserved = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    $previewBytes = @{}
-    foreach ($category in $categories) { $previewBytes[$category] = [long]0 }
+    $runBytes = @{}
+    foreach ($category in $categories) { $runBytes[$category] = [long]0 }
     foreach ($file in $files) {
         $category = $extensionMap[$file.Extension.ToLowerInvariant()]
         if (-not $category) { $category = '其他' }
@@ -301,7 +301,7 @@ try {
                 if (-not $migrationPaths.Contains($file.FullName)) { [void]$newPaths.Add($destination) }
             }
             [void]$reserved.Add($destination)
-            if (-not $Apply) { $previewBytes[$category] += $file.Length }
+            $runBytes[$category] += $(if ($Apply) { $current.Length } else { $file.Length })
         } catch {
             $record.Status = 'Failed'
             $record.Error = $_.Exception.Message
@@ -314,6 +314,26 @@ try {
     $categoryCounts = [ordered]@{}
     foreach ($category in $categories) {
         $categoryCounts[$category] = @($records | Where-Object { $_.Category -eq $category -and $_.Status -ne 'Failed' }).Count
+    }
+
+    $runStatistics = @(foreach ($category in $categories) {
+        if ($categoryCounts[$category] -gt 0) {
+            [pscustomobject]@{ Folder = $category; FileCount = $categoryCounts[$category]; Size = (Format-FileSize $runBytes[$category]) }
+        }
+    })
+    [long]$runTotalFiles = 0
+    [long]$runTotalBytes = 0
+    foreach ($category in $categories) {
+        $runTotalFiles += $categoryCounts[$category]
+        $runTotalBytes += $runBytes[$category]
+    }
+    $runSummary = [pscustomobject]@{
+        Phase = $(if ($Apply) { 'Completed' } else { 'Planned' })
+        Statistics = $runStatistics
+        TotalFiles = $runTotalFiles
+        TotalSize = Format-FileSize $runTotalBytes
+        Complete = (@($issues | Where-Object { $_.Stage -in @('Scan', 'Move') }).Count -eq 0)
+        AudioMigrationCount = @($records | Where-Object { $_.Status -in @('Moved', 'Planned') -and $migrationPaths.Contains($_.Source) }).Count
     }
 
     $duplicatePairs = @()
@@ -385,22 +405,24 @@ try {
                     if ($folderFiles.Count -eq 0) { continue }
                     [long]$bytes = 0
                     foreach ($item in $folderFiles) { $bytes += $item.Length }
-                    $statistics.Add([pscustomobject]@{ Folder = $name; FileCount = $folderFiles.Count; SizeKB = ($bytes / 1024.0).ToString('F2', $culture); Size = (Format-FileSize $bytes); Bytes = $bytes })
+                    $statistics.Add([pscustomobject]@{ Folder = $name; FileCount = $folderFiles.Count; Size = (Format-FileSize $bytes); Bytes = $bytes })
                 }
             }
         } catch { Add-Issue 'Statistics' $output $_.Exception.Message }
         $statisticsComplete = $issues.Count -eq $issueCountBeforeStats
-    } else {
-        foreach ($category in $categories) {
-            if ($categoryCounts[$category] -eq 0) { continue }
-            [long]$bytes = $previewBytes[$category]
-            $statistics.Add([pscustomobject]@{ Folder = $category; FileCount = $categoryCounts[$category]; SizeKB = ($bytes / 1024.0).ToString('F2', $culture); Size = (Format-FileSize $bytes); Bytes = $bytes })
-        }
-        $statisticsComplete = @($issues | Where-Object { $_.Stage -in @('Scan', 'Move') }).Count -eq 0
     }
     [long]$totalFiles = 0
     [long]$totalBytes = 0
     foreach ($row in $statistics) { $totalFiles += $row.FileCount; $totalBytes += $row.Bytes }
+    $inventory = $null
+    if ($Apply) {
+        $inventory = [pscustomobject]@{
+            Statistics = @($statistics | Select-Object Folder, FileCount, Size)
+            TotalFiles = $totalFiles
+            TotalSize = Format-FileSize $totalBytes
+            Complete = $statisticsComplete
+        }
+    }
     $recycleFailedCount = @($issues | Where-Object Stage -eq 'Recycle').Count
     if ($Apply) {
         $timestampLine = '统计时间：{0}（北京时间）' -f (Get-BeijingTime)
@@ -410,6 +432,10 @@ try {
         $lines.Add('微信文件整理统计')
         $lines.Add($outerDivider)
         $lines.Add($timestampLine)
+        $lines.Add(('本次移动成功：{0} 个，大小 {1}；移动失败 {2} 个。' -f $runSummary.TotalFiles, $runSummary.TotalSize, @($records | Where-Object Status -eq 'Failed').Count))
+        if (-not $runSummary.Complete) { $lines.Add('注意：本次扫描或移动有失败，请检查失败详情。') }
+        if ($MigrateLegacyAudio) { $lines.Add(('其中旧音频迁移成功：{0} 个。' -f $runSummary.AudioMigrationCount)) }
+        $lines.Add('以下表格为整理后库存（含历史文件）：')
         if (-not $statisticsComplete) { $lines.Add('注意：部分目录读取失败，以下统计不完整。') }
         $lines.Add('')
         $lines.AddRange([string[]]$table)
@@ -444,12 +470,11 @@ try {
         FailedCount = @($records | Where-Object Status -eq 'Failed').Count
         SkippedLinks = @($skippedLinks)
         Failures = $issues.ToArray()
-        Statistics = @($statistics | Select-Object Folder, FileCount, SizeKB, Size)
-        StatisticsComplete = $statisticsComplete
-        TotalFiles = $totalFiles
-        TotalSize = Format-FileSize $totalBytes
+        Run = $runSummary
+        Inventory = $inventory
         ReportPath = $(if ($reportWritten) { $reportPath } else { $null })
         Deduplicate = [bool]$Deduplicate
+        MigrateLegacyAudio = [bool]$MigrateLegacyAudio
         DuplicateCount = $duplicatePairs.Count
         DuplicateSize = Format-FileSize $duplicateBytes
         RecycledCount = $recycledCount
@@ -462,12 +487,15 @@ try {
     else {
         if ($Apply) { '整理完成（请检查下列失败信息）。' } else { '只读预览：未移动文件，未写入目录或报告。' }
         if ($Apply) {
-            foreach ($category in $categories) { if ($categoryCounts[$category]) { '{0}：{1} 个' -f $category, $categoryCounts[$category] } }
+            '本次移动成功：{0} 个，大小 {1}；整理后库存：{2} 个，大小 {3}。' -f $runSummary.TotalFiles, $runSummary.TotalSize, $inventory.TotalFiles, $inventory.TotalSize
+            if (-not $runSummary.Complete) { '注意：本次扫描或移动有失败，请检查失败详情。' }
+            if (-not $inventory.Complete) { '注意：整理后库存统计不完整。' }
         } else {
-            '预计分类（本次新文件及待迁移音频，不含其余已归类文件）：'
-            if (-not $statisticsComplete) { '注意：部分文件或目录处理失败，以下预览统计不完整。' }
-            Format-ReportTable -Rows $statistics.ToArray() -TotalFiles $totalFiles -TotalSize $result.TotalSize
+            '本次预计分类（仅本次待处理文件，不含其余已归类文件）：'
+            if (-not $runSummary.Complete) { '注意：部分文件或目录处理失败，以下预览统计不完整。' }
+            Format-ReportTable -Rows $runStatistics -TotalFiles $runTotalFiles -TotalSize $runSummary.TotalSize
         }
+        if ($MigrateLegacyAudio) { '本次旧音频迁移（计划或成功）：{0} 个' -f $runSummary.AudioMigrationCount }
         '重命名：{0} 个；移动失败：{1} 个；跳过链接：{2} 个' -f $result.RenamedCount, $result.FailedCount, $skippedLinks.Count
         if ($IncludeRecords) { foreach ($record in $records) { '[{0}] {1} -> {2}' -f $record.Status, $record.Source, $record.Destination; if ($record.KeptPath) { '保留：{0}' -f $record.KeptPath } } }
         if ($Deduplicate) {

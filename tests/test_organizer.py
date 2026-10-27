@@ -32,7 +32,7 @@ EXTENSIONS = {
 }
 
 
-def run(root, apply=False, check=True, include_records=False, as_json=True, deduplicate=False):
+def run(root, apply=False, check=True, include_records=False, as_json=True, deduplicate=False, migrate_audio=False):
     args = [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(SCRIPT), "-RootPath", str(root)]
     if as_json:
         args.append("-AsJson")
@@ -42,6 +42,8 @@ def run(root, apply=False, check=True, include_records=False, as_json=True, dedu
         args.append("-Apply")
     if deduplicate:
         args.append("-Deduplicate")
+    if migrate_audio:
+        args.append("-MigrateLegacyAudio")
     result = subprocess.run(args, capture_output=True, encoding="utf-8", env=POWERSHELL_ENV)
     if not check:
         return result
@@ -166,7 +168,7 @@ class OrganizerTests(unittest.TestCase):
         result = self.discover_default_locations(profile, documents)
         self.assertTrue(result["Success"])
         self.assertEqual(result["SearchRoots"], [str(base) for base in roots])
-        self.assertIsNone(result["SearchRoot"])
+        self.assertNotIn("SearchRoot", result)
         self.assertEqual(result["CandidateCount"], 2)
         self.assertEqual([c["RootPath"] for c in result["Candidates"]], [str(f.parent) for f in files])
         self.assertTrue(result["SelectionRequired"])
@@ -182,7 +184,7 @@ class OrganizerTests(unittest.TestCase):
                 result = self.discover_default_locations(profile, documents)
                 self.assertTrue(result["Success"])
                 self.assertEqual(result["CandidateCount"], 1)
-                self.assertTrue(result["SelectionRequired"])
+                self.assertFalse(result["SelectionRequired"])
                 self.assertEqual(result["Candidates"][0]["RootPath"], str(source.parent))
                 missing = documents if location == "profile" else profile
                 self.assertFalse(missing.exists())
@@ -210,7 +212,7 @@ class OrganizerTests(unittest.TestCase):
         source = put(custom / "指定账号" / "msg" / "file" / "资料.pdf")
         result = self.discover_default_locations(profile, documents, "-WechatBasePath", str(custom))
         self.assertEqual(result["SearchRoots"], [str(custom)])
-        self.assertEqual(result["SearchRoot"], str(custom))
+        self.assertNotIn("SearchRoot", result)
         self.assertEqual(result["Candidates"], [{"AccountFolder": "指定账号", "RootPath": str(source.parent)}])
 
     def test_trailing_separators_preserve_paths_and_discovery(self):
@@ -223,7 +225,7 @@ class OrganizerTests(unittest.TestCase):
         base = self.temp_path / "wechat"
         put(base / "账号" / "msg" / "file" / "样本.pdf")
         found = discover(str(base) + "\\")
-        self.assertEqual(found["SearchRoot"], str(base))
+        self.assertEqual(found["SearchRoots"], [str(base)])
         self.assertEqual(found["CandidateCount"], 1)
 
     def test_discovery_lists_accounts_without_modifying_or_selecting_them(self):
@@ -245,12 +247,12 @@ class OrganizerTests(unittest.TestCase):
         self.assertTrue(second.exists())
         self.assertFalse((second.parent / "整理归纳").exists())
 
-    def test_discovery_one_account_still_requires_selection(self):
+    def test_discovery_one_account_does_not_require_separate_selection(self):
         base = self.temp_path / "one-account"
         source = put(base / "only" / "msg" / "file" / "原件.docx")
         result = discover(base)
         self.assertEqual(result["CandidateCount"], 1)
-        self.assertTrue(result["SelectionRequired"])
+        self.assertFalse(result["SelectionRequired"])
         self.assertTrue(source.exists())
         self.assertFalse((source.parent / "整理归纳").exists())
 
@@ -303,8 +305,8 @@ class OrganizerTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
         applied = run(self.root, apply=True)
         self.assertEqual(preview["CategoryCounts"], applied["CategoryCounts"])
-        self.assertEqual(preview["Statistics"], applied["Statistics"])
-        self.assertEqual(preview["TotalSize"], applied["TotalSize"])
+        self.assertEqual(preview["Run"]["Statistics"], applied["Inventory"]["Statistics"])
+        self.assertEqual(preview["Run"]["TotalSize"], applied["Inventory"]["TotalSize"])
         self.assertTrue((self.root / "2026-01" / "深层").is_dir())
         self.assertTrue((self.output / "其他" / "根文件").exists())
 
@@ -346,15 +348,15 @@ class OrganizerTests(unittest.TestCase):
         preview = run(self.root)
         text = run(self.root, as_json=False)
         self.assertTrue(preview["Success"])
-        self.assertTrue(preview["StatisticsComplete"])
-        self.assertEqual(preview["TotalFiles"], 7)
-        stats = {row["Folder"]: row for row in preview["Statistics"]}
+        self.assertTrue(preview["Run"]["Complete"])
+        self.assertEqual(preview["Run"]["TotalFiles"], 7)
+        stats = {row["Folder"]: row for row in preview["Run"]["Statistics"]}
         for category, (_, size, display) in samples.items():
             self.assertEqual(stats[category]["FileCount"], 1)
             self.assertEqual(stats[category]["Size"], display)
-            self.assertEqual(stats[category]["SizeKB"], f"{size / 1024:.2f}")
+            self.assertNotIn("SizeKB", stats[category])
             self.assertRegex(text, rf"{re.escape(category)}\s+\|\s+1 个\s+\|\s+{re.escape(display)}")
-        self.assertEqual(preview["TotalSize"], f"{sum(s[1] for s in samples.values()) / 1024 ** 3:.2f} GB")
+        self.assertEqual(preview["Run"]["TotalSize"], f"{sum(s[1] for s in samples.values()) / 1024 ** 3:.2f} GB")
         self.assertRegex(text, r"总计\s+\|\s+7 个\s+\|\s+2\.00 GB")
         self.assertIsNone(preview["ReportPath"])
         self.assertFalse(self.output.exists())
@@ -367,10 +369,10 @@ class OrganizerTests(unittest.TestCase):
         put(self.output / "自定义" / "资料.bin", b"excluded")
         before = snapshot(self.root)
         result = run(self.root)
-        self.assertEqual(result["TotalFiles"], 2)
-        self.assertEqual(result["TotalSize"], "1.50 MB")
+        self.assertEqual(result["Run"]["TotalFiles"], 2)
+        self.assertEqual(result["Run"]["TotalSize"], "1.50 MB")
         self.assertEqual(result["RenamedCount"], 1)
-        stats = {row["Folder"]: row for row in result["Statistics"]}
+        stats = {row["Folder"]: row for row in result["Run"]["Statistics"]}
         self.assertEqual(stats["word"]["Size"], "768.00 KB")
         self.assertEqual(stats["PDF"]["Size"], "768.00 KB")
         self.assertNotIn("excel", stats)
@@ -379,11 +381,11 @@ class OrganizerTests(unittest.TestCase):
 
     def test_empty_preview_hides_zero_rows_and_has_no_output(self):
         result = run(self.root)
-        self.assertEqual(result["TotalFiles"], 0)
-        self.assertEqual(result["TotalSize"], "0.00 KB")
-        self.assertTrue(result["StatisticsComplete"])
-        self.assertEqual(result["Statistics"], [])
-        self.assertTrue(all(r["FileCount"] == 0 and r["Size"] == "0.00 KB" for r in result["Statistics"]))
+        self.assertEqual(result["Run"]["TotalFiles"], 0)
+        self.assertEqual(result["Run"]["TotalSize"], "0.00 KB")
+        self.assertTrue(result["Run"]["Complete"])
+        self.assertEqual(result["Run"]["Statistics"], [])
+        self.assertTrue(all(r["FileCount"] == 0 and r["Size"] == "0.00 KB" for r in result["Run"]["Statistics"]))
         self.assertFalse(self.output.exists())
 
     def test_preview_marks_unreadable_directory_as_incomplete(self):
@@ -393,9 +395,9 @@ class OrganizerTests(unittest.TestCase):
             result = run(self.root)
             text = run(self.root, as_json=False)
         self.assertFalse(result["Success"])
-        self.assertFalse(result["StatisticsComplete"])
-        self.assertEqual(result["TotalFiles"], 1)
-        self.assertEqual(result["TotalSize"], "2.00 KB")
+        self.assertFalse(result["Run"]["Complete"])
+        self.assertEqual(result["Run"]["TotalFiles"], 1)
+        self.assertEqual(result["Run"]["TotalSize"], "2.00 KB")
         self.assertIn("预览统计不完整", text)
         self.assertTrue(any(i["Stage"] == "Scan" for i in result["Failures"]))
         self.assertFalse(self.output.exists())
@@ -445,12 +447,12 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual((self.output / "word" / "同名.docx").read_bytes(), b"old")
         self.assertTrue((self.output / "word" / "同名 (1).docx").is_file())
         self.assertTrue((self.output / "word" / "同名 (2).docx").is_file())
-        stats = {r["Folder"]: r for r in result["Statistics"]}
+        stats = {r["Folder"]: r for r in result["Inventory"]["Statistics"]}
         for category in CATEGORIES:
             self.assertEqual(stats[category]["FileCount"], expected_counts[category])
-            self.assertEqual(stats[category]["SizeKB"], f"{expected_bytes[category] / 1024:.2f}")
+            self.assertEqual(stats[category]["Size"], f"{expected_bytes[category] / 1024:.2f} KB")
         self.assertEqual(stats["自定义"]["FileCount"], 1)
-        self.assertEqual(stats["自定义"]["SizeKB"], "3.00")
+        self.assertEqual(stats["自定义"]["Size"], "3.00 KB")
         report_path = Path(result["ReportPath"])
         self.assertTrue(report_path.read_bytes().startswith(b"\xef\xbb\xbf"))
         report = report_path.read_text(encoding="utf-8-sig")
@@ -470,7 +472,7 @@ class OrganizerTests(unittest.TestCase):
         repeated = run(self.root, apply=True)
         self.assertTrue(repeated["Success"], repeated["Failures"])
         self.assertEqual(repeated["FileCount"], 0)
-        self.assertEqual(repeated["Statistics"], result["Statistics"])
+        self.assertEqual(repeated["Inventory"]["Statistics"], result["Inventory"]["Statistics"])
         self.assertEqual(repeated["ReportPath"], result["ReportPath"])
         self.assertEqual(len(list(self.output.glob("整理统计.txt"))), 1)
         self.assertEqual(list(self.output.glob("移动记录_*.csv")), [legacy_csv])
@@ -488,7 +490,7 @@ class OrganizerTests(unittest.TestCase):
         repeated = run(self.root, apply=True)
         self.assertTrue(repeated["Success"], repeated["Failures"])
         self.assertEqual(repeated["FileCount"], 0)
-        self.assertEqual(first["Statistics"], repeated["Statistics"])
+        self.assertEqual(first["Inventory"]["Statistics"], repeated["Inventory"]["Statistics"])
         self.assertEqual([p.name for p in self.output.iterdir() if p.is_file()], ["整理统计.txt"])
         self.assertFalse(list(self.output.glob("移动记录_*.csv")))
 
@@ -507,22 +509,22 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual(response.returncode, 0, response.stderr)
         return json.loads(response.stdout)
 
-    def test_audio_extensions_and_existing_audio_migration_are_previewed(self):
+    def test_audio_extensions_and_opt_in_audio_migration_are_previewed(self):
         for index, ext in enumerate(EXTENSIONS["音频"].split()):
             put(self.root / "月份" / f"audio-{index}{ext.upper()}", bytes([index]))
         old = put(self.output / "其他" / "archive" / "saved.MP3", b"old audio")
         put(self.output / "音频" / "saved.MP3", b"different")
         before = snapshot(self.root)
-        preview = run(self.root, deduplicate=True)
+        preview = run(self.root, migrate_audio=True, deduplicate=True)
         self.assertTrue(preview["Success"], preview["Failures"])
         self.assertEqual(preview["CategoryCounts"]["音频"], 18)
         self.assertEqual(before, snapshot(self.root))
-        result = run(self.root, apply=True)
+        result = run(self.root, migrate_audio=True, apply=True)
         self.assertTrue(result["Success"], result["Failures"])
         self.assertFalse(old.exists())
         self.assertEqual((self.output / "音频" / "saved (1).MP3").read_bytes(), b"old audio")
-        self.assertEqual([r["Folder"] for r in result["Statistics"]], ["音频"])
-        self.assertEqual(result["Statistics"][0]["FileCount"], 19)
+        self.assertEqual([r["Folder"] for r in result["Inventory"]["Statistics"]], ["音频"])
+        self.assertEqual(result["Inventory"]["Statistics"][0]["FileCount"], 19)
         self.assertTrue((self.output / "其他" / "archive").is_dir())
         self.assertFalse((self.output / "PDF").exists())
 
@@ -539,7 +541,7 @@ class OrganizerTests(unittest.TestCase):
         self.assertTrue((self.output / "PDF" / "empty-child").exists())
         self.assertTrue((self.output / "custom-empty").exists())
         self.assertTrue(month.exists())
-        self.assertEqual(result["Statistics"], [{"Folder": "音频", "FileCount": 1, "SizeKB": "0.00", "Size": "0.00 KB"}])
+        self.assertEqual(result["Inventory"]["Statistics"], [{"Folder": "音频", "FileCount": 1, "Size": "0.00 KB"}])
         self.assertEqual(len(result["CategoryCounts"]), 8)
 
     def test_preview_dedup_respects_category_boundary_and_keeps_existing(self):
@@ -576,7 +578,8 @@ class OrganizerTests(unittest.TestCase):
         self.assertTrue(result["Success"], result["Failures"])
         self.assertEqual(result["DuplicateCount"], 3)
         self.assertEqual(result["RecycledCount"], 3)
-        self.assertEqual(result["TotalFiles"], 2)
+        self.assertEqual(result["Run"]["TotalFiles"], 2)
+        self.assertEqual(result["Inventory"]["TotalFiles"], 2)
         self.assertEqual(kept.read_bytes(), b"duplicate data")
         self.assertEqual(len(list((self.output / "word").iterdir())), 2)
         details = [r for r in result["Records"] if r["Status"] == "Recycled"]
@@ -588,7 +591,7 @@ class OrganizerTests(unittest.TestCase):
         self.assertTrue(repeated["Success"], repeated["Failures"])
         self.assertEqual(repeated["DuplicateCount"], 0)
         self.assertEqual(repeated["RecycledCount"], 0)
-        self.assertEqual(result["Statistics"], repeated["Statistics"])
+        self.assertEqual(result["Inventory"]["Statistics"], repeated["Inventory"]["Statistics"])
 
     def test_creation_time_tie_uses_full_path_and_empty_files_are_duplicates(self):
         a = put(self.output / "word" / "a.docx", b"")
@@ -607,10 +610,10 @@ class OrganizerTests(unittest.TestCase):
         put(self.root / "new.mp3", b"same audio")
         put(self.output / "其他" / "existing.mp3", b"same audio")
         self.restore_recycled = True
-        result = run(self.root, apply=True, deduplicate=True, include_records=True)
+        result = run(self.root, migrate_audio=True, apply=True, deduplicate=True, include_records=True)
         self.assertTrue(result["Success"], result["Failures"])
         self.assertEqual(result["RecycledCount"], 1)
-        self.assertEqual(result["TotalFiles"], 1)
+        self.assertEqual(result["Inventory"]["TotalFiles"], 1)
         self.assertEqual((self.output / "音频" / "existing.mp3").read_bytes(), b"same audio")
         self.assertFalse((self.output / "其他").exists())
         self.assertFalse((self.output / "音频" / "new.mp3").exists())
@@ -629,7 +632,7 @@ class OrganizerTests(unittest.TestCase):
         self.assertFalse(result["Success"])
         self.assertEqual(result["RecycledCount"], 0)
         self.assertEqual(result["RecycleFailedCount"], 1)
-        self.assertEqual(result["TotalFiles"], 2)
+        self.assertEqual(result["Inventory"]["TotalFiles"], 2)
         self.assertTrue(kept.exists() and copy.exists())
         self.assertIn("回收失败 1 个", Path(result["ReportPath"]).read_text(encoding="utf-8-sig"))
 
@@ -638,7 +641,7 @@ class OrganizerTests(unittest.TestCase):
         put(self.root / "second.docx", b"same")
         plain = run(self.root, apply=True)
         self.assertEqual(plain["RecycledCount"], 0)
-        self.assertEqual(plain["TotalFiles"], 2)
+        self.assertEqual(plain["Inventory"]["TotalFiles"], 2)
         (self.output / "word" / "second.docx").unlink()
         put(self.output / "PDF" / "same.pdf", b"same")
         put(self.output / "custom" / "a.docx", b"same")
@@ -646,7 +649,7 @@ class OrganizerTests(unittest.TestCase):
         result = run(self.root, apply=True, deduplicate=True)
         self.assertTrue(result["Success"], result["Failures"])
         self.assertEqual(result["DuplicateCount"], 0)
-        self.assertEqual(result["TotalFiles"], 4)
+        self.assertEqual(result["Inventory"]["TotalFiles"], 4)
 
     def test_unreadable_duplicate_and_changed_files_are_retained(self):
         kept = put(self.output / "word" / "keep.docx", b"same")
@@ -691,12 +694,12 @@ $sink.Dispose()
     def test_empty_run_and_rounded_fractional_kb(self):
         empty = run(self.root, apply=True)
         self.assertTrue(empty["Success"])
-        self.assertEqual(empty["Statistics"], [])
-        self.assertTrue(all(r["FileCount"] == 0 and r["SizeKB"] == "0.00" for r in empty["Statistics"]))
+        self.assertEqual(empty["Inventory"]["Statistics"], [])
+        self.assertTrue(all(r["FileCount"] == 0 and r["Size"] == "0.00 KB" for r in empty["Inventory"]["Statistics"]))
         put(self.root / "fraction.pdf", b"1234567890")
         result = run(self.root, apply=True)
-        pdf = next(r for r in result["Statistics"] if r["Folder"] == "PDF")
-        self.assertEqual(pdf["SizeKB"], "0.01")
+        pdf = next(r for r in result["Inventory"]["Statistics"] if r["Folder"] == "PDF")
+        self.assertEqual(pdf["Size"], "0.01 KB")
 
     def test_pdf_category_handles_uppercase_duplicates_and_repeated_runs(self):
         put(self.output / "PDF" / "报告.pdf", b"existing")
@@ -715,12 +718,12 @@ $sink.Dispose()
         self.assertEqual(contents, {b"existing", b"first", b"second"})
         self.assertEqual((self.output / "PDF" / "报告.pdf").read_bytes(), b"existing")
         self.assertFalse((self.output / "其他").exists())
-        stats = next(row for row in result["Statistics"] if row["Folder"] == "PDF")
+        stats = next(row for row in result["Inventory"]["Statistics"] if row["Folder"] == "PDF")
         self.assertEqual(stats["FileCount"], 3)
         self.assertRegex(Path(result["ReportPath"]).read_text(encoding="utf-8-sig"), r"PDF\s+\|\s+3 个\s+\|")
         repeated = run(self.root, apply=True)
         self.assertEqual(repeated["FileCount"], 0)
-        self.assertEqual(repeated["Statistics"], result["Statistics"])
+        self.assertEqual(repeated["Inventory"]["Statistics"], result["Inventory"]["Statistics"])
 
     def test_report_automatically_selects_kb_mb_and_gb(self):
         sizes = {
@@ -741,7 +744,7 @@ $sink.Dispose()
                 put_sparse(self.output / category / "大小测试.bin", size)
         result = run(self.root, apply=True)
         self.assertTrue(result["Success"], result["Failures"])
-        stats = {row["Folder"]: row for row in result["Statistics"]}
+        stats = {row["Folder"]: row for row in result["Inventory"]["Statistics"]}
         report = Path(result["ReportPath"]).read_text(encoding="utf-8-sig")
         for category, display in expected.items():
             with self.subTest(category=category):
@@ -749,7 +752,7 @@ $sink.Dispose()
                     self.assertNotIn(category, stats)
                     continue
                 self.assertEqual(stats[category]["Size"], display)
-                self.assertEqual(stats[category]["SizeKB"], f"{sizes[category] / 1024:.2f}")
+                self.assertNotIn("SizeKB", stats[category])
                 self.assertRegex(report, rf"(?m)^{re.escape(category)}\s+\|\s+\d+ 个\s+\|\s+{re.escape(display)}$")
         self.assertRegex(report, r"总计\s+\|\s+5 个\s+\|\s+2\.00 GB")
         self.assertNotIn("字节", report)
@@ -759,7 +762,7 @@ $sink.Dispose()
         put(self.output / "excel" / "二.xlsx", b"x" * (768 * 1024))
         result = run(self.root, apply=True)
         self.assertTrue(result["Success"])
-        stats = {row["Folder"]: row for row in result["Statistics"]}
+        stats = {row["Folder"]: row for row in result["Inventory"]["Statistics"]}
         self.assertEqual(stats["word"]["Size"], "768.00 KB")
         self.assertEqual(stats["excel"]["Size"], "768.00 KB")
         report = Path(result["ReportPath"]).read_text(encoding="utf-8-sig")
@@ -810,9 +813,13 @@ $sink.Dispose()
             detailed = run(self.root, apply=True, include_records=True)
         self.assertFalse(result["Success"])
         self.assertEqual(result["FailedCount"], 1)
+        self.assertEqual(result["Run"]["TotalFiles"], 1)
+        self.assertEqual(result["Run"]["TotalSize"], "2.00 KB")
+        self.assertFalse(result["Run"]["Complete"])
+        self.assertTrue(result["Inventory"]["Complete"])
         self.assertTrue(blocked.exists())
         self.assertTrue((self.output / "PDF" / "正常.pdf").exists())
-        self.assertEqual(sum(r["FileCount"] for r in result["Statistics"]), 1)
+        self.assertEqual(sum(r["FileCount"] for r in result["Inventory"]["Statistics"]), 1)
         self.assertTrue(Path(result["ReportPath"]).exists())
         self.assertNotIn("Records", result)
         self.assertTrue(any(i["Stage"] == "Move" and i["Path"] == str(blocked) and i["Message"]
@@ -835,7 +842,8 @@ $sink.Dispose()
         with ExclusiveFile(blocked):
             result = run(self.root, apply=True)
         self.assertFalse(result["Success"])
-        self.assertFalse(result["StatisticsComplete"])
+        self.assertFalse(result["Inventory"]["Complete"])
+        self.assertTrue(result["Run"]["Complete"])
         self.assertTrue(any(i["Stage"] == "Statistics" for i in result["Failures"]))
         self.assertIn("统计不完整", Path(result["ReportPath"]).read_text(encoding="utf-8-sig"))
         self.assertTrue((blocked / "资料.bin").exists())
@@ -859,7 +867,7 @@ $sink.Dispose()
             self.make_symlink(outside, target_link, target_is_directory=True)
             try:
                 stats = run(self.root, apply=True)
-                self.assertNotIn("额外链接", [r["Folder"] for r in stats["Statistics"]])
+                self.assertNotIn("额外链接", [r["Folder"] for r in stats["Inventory"]["Statistics"]])
             finally:
                 target_link.unlink()
             if (self.output / "word").exists():
@@ -908,6 +916,54 @@ $sink.Dispose()
             self.assertFalse((source.parent / "整理归纳").exists())
         finally:
             link.unlink()
+
+    def test_run_counts_are_separate_from_inventory_and_repeat(self):
+        for index in range(100):
+            put(self.output / "word" / f"old-{index}.docx", b"old")
+        for index in range(10):
+            put(self.root / f"new-{index}.pdf", b"newdata")
+        before = snapshot(self.root)
+        preview = run(self.root)
+        self.assertEqual(preview["Run"]["TotalFiles"], 10)
+        self.assertEqual(preview["Run"]["Phase"], "Planned")
+        self.assertIsNone(preview["Inventory"])
+        self.assertEqual(before, snapshot(self.root))
+        result = run(self.root, apply=True)
+        self.assertEqual(result["Run"]["Phase"], "Completed")
+        self.assertEqual(result["Run"]["TotalFiles"], 10)
+        self.assertEqual(result["Inventory"]["TotalFiles"], 110)
+        self.assertEqual(result["Run"]["Statistics"], preview["Run"]["Statistics"])
+        for key in ["Statistics", "StatisticsComplete", "TotalFiles", "TotalSize"]:
+            self.assertNotIn(key, result)
+        report = Path(result["ReportPath"]).read_text(encoding="utf-8-sig")
+        self.assertIn("本次移动成功：10 个", report)
+        self.assertRegex(report, r"总计\s+\|\s+110 个")
+        repeated = run(self.root, apply=True)
+        self.assertEqual(repeated["Run"]["TotalFiles"], 0)
+        self.assertEqual(repeated["Inventory"]["TotalFiles"], 110)
+
+    def test_legacy_audio_stays_put_by_default_even_with_dedup(self):
+        old = put(self.output / "其他" / "old.mp3", b"same audio")
+        put(self.root / "new.mp3", b"same audio")
+        before = snapshot(self.root)
+        preview = run(self.root, deduplicate=True)
+        self.assertEqual(preview["Run"]["TotalFiles"], 1)
+        self.assertEqual(preview["Run"]["AudioMigrationCount"], 0)
+        self.assertEqual(preview["DuplicateCount"], 0)
+        self.assertEqual(before, snapshot(self.root))
+        result = run(self.root, apply=True, deduplicate=True)
+        self.assertTrue(result["Success"], result["Failures"])
+        self.assertFalse(result["MigrateLegacyAudio"])
+        self.assertEqual(result["Run"]["TotalFiles"], 1)
+        self.assertEqual(result["Inventory"]["TotalFiles"], 2)
+        self.assertEqual(result["RecycledCount"], 0)
+        self.assertEqual(old.read_bytes(), b"same audio")
+        self.assertEqual((self.output / "音频" / "new.mp3").read_bytes(), b"same audio")
+        planned = run(self.root, migrate_audio=True, deduplicate=True, include_records=True)
+        self.assertEqual(planned["Run"]["TotalFiles"], 1)
+        self.assertEqual(planned["Run"]["AudioMigrationCount"], 1)
+        self.assertEqual(planned["DuplicateCount"], 1)
+        self.assertTrue(old.exists())
 
     def test_existing_target_file_is_rejected_before_moving(self):
         source = put(self.root / "原件.docx")
