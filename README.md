@@ -8,12 +8,12 @@
 
 ## 安装
 
-把整个 `wechat_download_files_organizer` 文件夹放入对应位置：
+把整个 `wechat-download-files-organizer` 文件夹放入对应位置：
 
 | 工具 | 安装目录 | 手动调用 |
 |---|---|---|
-| Codex | `%USERPROFILE%\.agents\skills\wechat_download_files_organizer` | `$wechat_download_files_organizer` |
-| Claude Code | `%USERPROFILE%\.claude\skills\wechat_download_files_organizer` | `/wechat_download_files_organizer` |
+| Codex | `%USERPROFILE%\.agents\skills\wechat-download-files-organizer` | `$wechat-download-files-organizer` |
+| Claude Code | `%USERPROFILE%\.claude\skills\wechat-download-files-organizer` | `/wechat-download-files-organizer` |
 
 该skill仅支持显式调用。
 

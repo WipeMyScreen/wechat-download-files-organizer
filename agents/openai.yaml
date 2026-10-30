@@ -1,7 +1,7 @@
 interface:
-  display_name: "wechat_download_files_organizer"
+  display_name: "wechat-download-files-organizer"
   short_description: "归类微信文件和音频，支持预览、普通移动、重复副本回收及 TXT 统计"
-  default_prompt: "使用 $wechat_download_files_organizer，整理微信下载文件；仅询问尚未明确的目录和操作，尽量合并为一次选择。"
+  default_prompt: "使用 $wechat-download-files-organizer，整理微信下载文件；仅询问尚未明确的目录和操作，尽量合并为一次选择。"
 
 policy:
   allow_implicit_invocation: false

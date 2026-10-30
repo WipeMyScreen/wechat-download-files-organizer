@@ -1,5 +1,5 @@
 ---
-name: wechat_download_files_organizer
+name: wechat-download-files-organizer
 description: 用户想整理 Windows 微信下载文件、分类 xwechat_files 中的附件或检查重复副本时使用。支持只读预览、分类移动、可选重复副本回收及 TXT 统计。
 disable-model-invocation: true
 ---
