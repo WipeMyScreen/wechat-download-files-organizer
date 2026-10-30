@@ -141,31 +141,36 @@ class OrganizerTests(unittest.TestCase):
             self.assertEqual(restored.returncode, 0, restored.stderr)
         shutil.rmtree(self.temp_path)
 
-    def discover_default_locations(self, profile, documents, *extra):
-        # Substitute only the OS folder lookups in a disposable copy; exercise
-        # the real default-discovery branch without reading real WeChat accounts.
+    def discover_default_locations(self, profile, *extra, system_profile=None, check=True):
+        # Substitute the OS profile lookup and USERPROFILE in a disposable copy;
+        # exercise default discovery without reading real WeChat accounts.
         script = SCRIPT.read_text(encoding="utf-8-sig")
-        for folder, path in [("UserProfile", profile), ("MyDocuments", documents)]:
-            lookup = f"[Environment]::GetFolderPath('{folder}')"
-            self.assertEqual(script.count(lookup), 1)
-            script = script.replace(lookup, "'" + str(path).replace("'", "''") + "'")
+        lookup = "[Environment]::GetFolderPath('UserProfile')"
+        self.assertEqual(script.count(lookup), 1)
+        fallback = profile if system_profile is None else system_profile
+        script = script.replace(lookup, "'" + str(fallback).replace("'", "''") + "'")
         test_script = self.temp_path / "discover-defaults.ps1"
         test_script.write_text(script, encoding="utf-8-sig")
+        test_env = {k: v for k, v in POWERSHELL_ENV.items() if k.upper() != "USERPROFILE"}
+        if profile is not None:
+            test_env["USERPROFILE"] = str(profile)
         result = subprocess.run(
             [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(test_script),
              "-ListAccounts", "-AsJson", *extra],
-            capture_output=True, encoding="utf-8", env=POWERSHELL_ENV,
+            capture_output=True, encoding="utf-8", env=test_env,
         )
+        if not check:
+            return result
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
     def test_default_discovery_combines_both_locations_without_selecting(self):
         profile = self.temp_path / "用户目录"
-        documents = self.temp_path / "重定向文档"
+        documents = profile / "Documents"
         roots = [profile / "xwechat_files", documents / "xwechat_files"]
         files = [put(base / "同名账号" / "msg" / "file" / "原件.docx") for base in roots]
         before = [snapshot(base) for base in roots]
-        result = self.discover_default_locations(profile, documents)
+        result = self.discover_default_locations(profile)
         self.assertTrue(result["Success"])
         self.assertEqual(result["SearchRoots"], [str(base) for base in roots])
         self.assertNotIn("SearchRoot", result)
@@ -178,39 +183,62 @@ class OrganizerTests(unittest.TestCase):
         for location in ["profile", "documents"]:
             with self.subTest(location=location):
                 profile = self.temp_path / location / "用户"
-                documents = self.temp_path / location / "文档"
+                documents = profile / "Documents"
                 parent = profile if location == "profile" else documents
                 source = put(parent / "xwechat_files" / "账号" / "msg" / "file" / "资料.pdf")
-                result = self.discover_default_locations(profile, documents)
+                result = self.discover_default_locations(profile)
                 self.assertTrue(result["Success"])
                 self.assertEqual(result["CandidateCount"], 1)
                 self.assertFalse(result["SelectionRequired"])
                 self.assertEqual(result["Candidates"][0]["RootPath"], str(source.parent))
-                missing = documents if location == "profile" else profile
+                missing = (documents if location == "profile" else profile) / "xwechat_files"
                 self.assertFalse(missing.exists())
 
     def test_default_discovery_missing_locations_does_not_create_them(self):
-        profile, documents = self.temp_path / "用户", self.temp_path / "文档"
-        result = self.discover_default_locations(profile, documents)
+        profile = self.temp_path / "用户"
+        documents = profile / "Documents"
+        result = self.discover_default_locations(profile)
         self.assertEqual(result["Candidates"], [])
         self.assertTrue(result["SelectionRequired"])
-        self.assertFalse(profile.exists())
-        self.assertFalse(documents.exists())
+        # PowerShell itself may initialize caches under the test USERPROFILE.
+        self.assertFalse((profile / "xwechat_files").exists())
+        self.assertFalse((documents / "xwechat_files").exists())
 
-    def test_default_discovery_deduplicates_same_location(self):
+    def test_default_discovery_prefers_real_environment_over_sandbox_identity(self):
         profile = self.temp_path / "用户"
         put(profile / "xwechat_files" / "账号" / "msg" / "file" / "资料.pdf")
-        result = self.discover_default_locations(profile, str(profile).upper() + "\\")
-        self.assertEqual(result["SearchRoots"], [str(profile / "xwechat_files")])
+        sandbox = self.temp_path / "CodexSandboxOffline"
+        put(sandbox / "xwechat_files" / "错误账号" / "msg" / "file" / "资料.pdf")
+        result = self.discover_default_locations(profile, system_profile=sandbox)
+        self.assertEqual(result["SearchRoots"], [str(profile / "xwechat_files"),
+                                               str(profile / "Documents" / "xwechat_files")])
         self.assertEqual(result["CandidateCount"], 1)
+        self.assertEqual(result["Candidates"][0]["AccountFolder"], "账号")
+
+    def test_default_discovery_falls_back_to_real_system_profile(self):
+        profile = self.temp_path / "用户"
+        source = put(profile / "Documents" / "xwechat_files" / "账号" / "msg" / "file" / "资料.pdf")
+        for environment_profile in [None, self.temp_path / "CodexSandboxOnline"]:
+            with self.subTest(environment_profile=environment_profile):
+                result = self.discover_default_locations(environment_profile, system_profile=profile)
+                self.assertEqual(result["Candidates"][0]["RootPath"], str(source.parent))
+
+    def test_default_discovery_refuses_sandbox_only_profiles(self):
+        sandbox = self.temp_path / "CodexSandboxOffline"
+        source = put(sandbox / "xwechat_files" / "账号" / "msg" / "file" / "资料.pdf")
+        result = self.discover_default_locations(sandbox, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("无法识别真实用户目录", result.stderr)
+        self.assertTrue(source.exists())
 
     def test_explicit_discovery_path_replaces_both_defaults(self):
-        profile, documents = self.temp_path / "用户", self.temp_path / "文档"
+        profile = self.temp_path / "用户"
+        documents = profile / "Documents"
         for parent in [profile, documents]:
             put(parent / "xwechat_files" / "默认账号" / "msg" / "file" / "资料.pdf")
         custom = self.temp_path / "自定义存储"
         source = put(custom / "指定账号" / "msg" / "file" / "资料.pdf")
-        result = self.discover_default_locations(profile, documents, "-WechatBasePath", str(custom))
+        result = self.discover_default_locations(profile, "-WechatBasePath", str(custom))
         self.assertEqual(result["SearchRoots"], [str(custom)])
         self.assertNotIn("SearchRoot", result)
         self.assertEqual(result["Candidates"], [{"AccountFolder": "指定账号", "RootPath": str(source.parent)}])

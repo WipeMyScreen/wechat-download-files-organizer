@@ -27,7 +27,14 @@ powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -ListAc
 powershell.exe -NoProfile -NonInteractive -File "./scripts/organize.ps1" -RootPath "<真实目录>" -MigrateLegacyAudio -AsJson
 ```
 
-默认发现当前用户目录及系统实际文档目录中的 `xwechat_files/<账号>/msg/file`，根目录去重，不扫描下载文件内容。`Candidates` 给出账号名与完整路径，`SearchRoots` 始终为数组。`SelectionRequired=false` 表示仅有一个候选，不表示已经授权移动；执行仍须显式传入 `-RootPath`。
+默认仅在以下两个位置发现 `<账号>\msg\file`，不扫描下载文件内容：
+
+1. `C:\Users\<用户名>\xwechat_files`
+2. `C:\Users\<用户名>\Documents\xwechat_files`
+
+真实用户目录优先取环境变量 `USERPROFILE`，为空或属于 `CodexSandbox*` 时回退到系统 UserProfile；两者均排除 `CodexSandbox*` 沙箱账号。无法识别时停止并提示指定目录，不枚举其他用户。`Documents` 固定为该用户目录下的子目录，不使用系统重定向到 OneDrive 等位置的文档目录。显式指定 `-WechatBasePath` 仍可替代默认搜索位置。
+
+`Candidates` 给出账号名与完整路径，`SearchRoots` 始终为数组并去重。`SelectionRequired=false` 表示仅有一个候选，不表示已经授权移动；执行仍须显式传入 `-RootPath`。
 
 ## 输出接口
 

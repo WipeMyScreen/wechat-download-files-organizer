@@ -168,9 +168,24 @@ if ($ListAccounts) {
         throw '列出账号不能与 -Apply、-Deduplicate、-MigrateLegacyAudio 或 -RootPath 同时使用。'
     }
     if ([string]::IsNullOrWhiteSpace($WechatBasePath)) {
-        $userProfileDirectory = [Environment]::GetFolderPath('UserProfile')
-        $documents = [Environment]::GetFolderPath('MyDocuments')
-        $basePaths = @($userProfileDirectory, $documents) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { Join-Path $_ 'xwechat_files' }
+        # Codex may run as a sandbox identity while USERPROFILE still identifies
+        # the desktop user. Never discover accounts under a Codex sandbox profile.
+        $userProfileDirectory = $null
+        foreach ($profileCandidate in @($env:USERPROFILE, [Environment]::GetFolderPath('UserProfile'))) {
+            if ([string]::IsNullOrWhiteSpace($profileCandidate)) { continue }
+            $normalizedProfile = Get-NormalizedDirectoryPath $profileCandidate
+            if ([IO.Path]::GetFileName($normalizedProfile) -like 'CodexSandbox*') { continue }
+            $userProfileDirectory = $normalizedProfile
+            break
+        }
+        if (-not $userProfileDirectory) {
+            throw '无法识别真实用户目录（已排除 Codex 沙箱账号）。请指定 -WechatBasePath 或 -RootPath。'
+        }
+        # Only the two agreed locations; do not follow redirected Documents.
+        $basePaths = @(
+            (Join-Path $userProfileDirectory 'xwechat_files')
+            (Join-Path $userProfileDirectory 'Documents\xwechat_files')
+        )
     } else {
         $basePaths = @($WechatBasePath)
     }
